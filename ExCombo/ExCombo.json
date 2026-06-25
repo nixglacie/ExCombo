@@ -1,0 +1,8 @@
+{
+  "Author": "Exora",
+  "Name": "ExCombo",
+  "Punchline": "Node-based job rotation flow editor.",
+  "Description": "Design your job rotation as a visual node graph. Flows replace hotbar actions in-game as you build them. Use /excombo to open the editor.",
+  "ApplicableVersion": "any",
+  "Tags": ["combat", "rotation", "combo", "nodes", "flow"]
+}
