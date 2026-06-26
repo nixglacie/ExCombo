@@ -179,6 +179,9 @@ public class FlowEditorWindow : Window {
         if (_pendingDeleteNodeId != null) {
             _flow.Nodes.RemoveAll(n => n.Id == _pendingDeleteNodeId);
             _flow.Edges.RemoveAll(e => e.FromNodeId == _pendingDeleteNodeId || e.ToNodeId == _pendingDeleteNodeId);
+            _selectedNodeIds.Remove(_pendingDeleteNodeId);
+            if (_draggingNode?.Id == _pendingDeleteNodeId) _draggingNode = null;
+            if (_pendingFrom == _pendingDeleteNodeId) { _pendingFrom = null; _pendingFromBranch = null; }
             _pendingDeleteNodeId = null;
             _config.Save();
         }
@@ -739,7 +742,8 @@ public class FlowEditorWindow : Window {
             ImGui.TextDisabled(_pickerCache.Count == 0 ? "Not in-game or job not loaded." : "Select an action.");
 
         ImGui.Spacing();
-        if (!_pickerSelected.HasValue) ImGui.BeginDisabled();
+        var noSel = !_pickerSelected.HasValue;
+        if (noSel) ImGui.BeginDisabled();
         if (ImGui.Button("Add##act")) {
             var node = new FlowNode {
                 Type        = type,
@@ -758,7 +762,7 @@ public class FlowEditorWindow : Window {
             _pickerSelected = null; _pickerSearch = "";
             ImGui.CloseCurrentPopup();
         }
-        if (!_pickerSelected.HasValue) ImGui.EndDisabled();
+        if (noSel) ImGui.EndDisabled();
         ImGui.SameLine();
         if (ImGui.Button("Cancel##act")) { _pickerSelected = null; _pickerSearch = ""; _autoConnectFrom = null; _autoConnectBranch = null; ImGui.CloseCurrentPopup(); }
     }

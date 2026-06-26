@@ -24,12 +24,12 @@ public class FlowExecutor {
     public uint? PeekNext() {
         var job = CharacterState.GetCharacterJob();
         if (!ActionHelpers.JobActionIDs.TryGetValue(job, out uint baseId)) return null;
-        // GetAdjustedActionId fires the hook, which calls Resolve() internally.
-        // Return that result directly — don't call Resolve() again with an already-resolved ID.
         return Plugin.Actions.GetAdjustedActionId(baseId);
     }
 
     public uint? Resolve(uint adjustedActionId) {
+        uint lastComboMove = Plugin.Actions.GetLastUsedActionId();
+
         foreach (var flow in _config.Flows) {
             if (!flow.Enabled) continue;
 
@@ -59,20 +59,107 @@ public class FlowExecutor {
                             if (e.FromNodeId == trigger.Id && e.ToNodeId == group.Id) {
                                 { var t = Environment.TickCount64; EdgeTrace[e.Id] = (t, EdgeStreak(e.Id, t)); } break;
                             }
+                        { var t = Environment.TickCount64; NodeTrace[group.Id] = (t, NodeStreak(group.Id, t), null); }
                     }
-                    var r = Walk(flow, group.Id, new HashSet<string>());
+
+                    // Per-group mid-combo: find lastComboMove within this group and advance from it.
+                    // Each group is checked independently so higher-priority groups (OGCDs) still
+                    // get their fresh evaluation even when mid-sequence in a lower-priority group.
+                    if (lastComboMove != 0) {
+                        var (adv, found, hasOutgoing) = FindAndAdvance(flow, group.Id, lastComboMove, new HashSet<string>());
+                        if (found) {
+                            if (adv.HasValue) return adv;
+                            if (hasOutgoing) continue; // next step blocked in this group — skip it
+                            // terminal action: fall through to fresh WalkFromNode (restart this group)
+                        }
+                    }
+
+                    var r = WalkFromNode(flow, group.Id, new HashSet<string>());
                     if (r.HasValue) return r;
                 }
                 continue;
             }
 
-            var result = Walk(flow, trigger.Id, new HashSet<string>());
+            // No groups: same two-phase logic from trigger
+            if (lastComboMove != 0) {
+                var (adv, found, hasOutgoing) = FindAndAdvance(flow, trigger.Id, lastComboMove, new HashSet<string>());
+                if (found) {
+                    if (adv.HasValue) return adv;
+                    if (hasOutgoing) continue; // blocked
+                    // terminal: fall through to restart
+                }
+            }
+
+            var result = WalkFromNode(flow, trigger.Id, new HashSet<string>());
             if (result.HasValue) return result;
         }
         return null;
     }
 
-    private uint? Walk(ComboFlow flow, string nodeId, HashSet<string> visited) {
+    // Searches the subtree rooted at nodeId for an Action node matching targetActionId,
+    // following condition branches as evaluated right now. When found, advances to the
+    // next step via WalkFromNode and returns (nextAction, found=true, hasOutgoing).
+    private (uint? next, bool found, bool hasOutgoing) FindAndAdvance(
+        ComboFlow flow, string nodeId, uint targetActionId, HashSet<string> visited)
+    {
+        if (!visited.Add(nodeId)) return (null, false, false);
+
+        FlowNode? node = null;
+        foreach (var n in flow.Nodes) {
+            if (n.Id == nodeId) { node = n; break; }
+        }
+        if (node == null) return (null, false, false);
+
+        if (node.Type == NodeType.Condition) {
+            bool eval = ConditionEvaluator.Eval(node);
+            if (TraceEnabled) { var t = Environment.TickCount64; NodeTrace[nodeId] = (t, NodeStreak(nodeId, t), eval); }
+            foreach (var edge in flow.Edges) {
+                if (edge.FromNodeId != nodeId) continue;
+                if (edge.Branch != null && edge.Branch != eval) continue;
+                if (TraceEnabled) { var t = Environment.TickCount64; EdgeTrace[edge.Id] = (t, EdgeStreak(edge.Id, t)); }
+                var r = FindAndAdvance(flow, edge.ToNodeId, targetActionId, new HashSet<string>(visited));
+                if (r.found) return r;
+            }
+            return (null, false, false);
+        }
+
+        if (node.Type == NodeType.Action) {
+            if (node.ActionId == targetActionId) {
+                if (TraceEnabled) { var t = Environment.TickCount64; NodeTrace[nodeId] = (t, NodeStreak(nodeId, t), true); }
+                bool hasOutgoing = false;
+                uint? adv = null;
+                foreach (var edge in flow.Edges) {
+                    if (edge.FromNodeId != nodeId) continue;
+                    hasOutgoing = true;
+                    adv = WalkFromNode(flow, edge.ToNodeId, new HashSet<string> { nodeId });
+                    if (adv.HasValue) break;
+                }
+                return (adv, true, hasOutgoing);
+            }
+            // Not the target — keep searching this action's children
+            foreach (var edge in flow.Edges) {
+                if (edge.FromNodeId != nodeId) continue;
+                var r = FindAndAdvance(flow, edge.ToNodeId, targetActionId, new HashSet<string>(visited));
+                if (r.found) return r;
+            }
+            return (null, false, false);
+        }
+
+        // Trigger / Group
+        if (TraceEnabled) { var t = Environment.TickCount64; NodeTrace[nodeId] = (t, NodeStreak(nodeId, t), null); }
+        foreach (var edge in flow.Edges) {
+            if (edge.FromNodeId != nodeId) continue;
+            if (TraceEnabled) { var t = Environment.TickCount64; EdgeTrace[edge.Id] = (t, EdgeStreak(edge.Id, t)); }
+            var r = FindAndAdvance(flow, edge.ToNodeId, targetActionId, new HashSet<string>(visited));
+            if (r.found) return r;
+        }
+        return (null, false, false);
+    }
+
+    // Finds the first reachable Action from nodeId, following condition branches as evaluated.
+    // Action nodes return themselves immediately — no recursion into their children.
+    // Blocked condition branches return null without walking back to a previous action.
+    private uint? WalkFromNode(ComboFlow flow, string nodeId, HashSet<string> visited) {
         if (!visited.Add(nodeId)) return null;
 
         FlowNode? node = null;
@@ -88,31 +175,24 @@ public class FlowExecutor {
                 if (edge.FromNodeId != nodeId) continue;
                 if (edge.Branch != null && edge.Branch != result) continue;
                 if (TraceEnabled) { var t = Environment.TickCount64; EdgeTrace[edge.Id] = (t, EdgeStreak(edge.Id, t)); }
-                var r = Walk(flow, edge.ToNodeId, new HashSet<string>(visited));
+                var r = WalkFromNode(flow, edge.ToNodeId, new HashSet<string>(visited));
                 if (r.HasValue) return r;
             }
-            return null;
+            return null; // condition blocked — no walk-back
         }
 
         if (node.Type == NodeType.Action) {
             if (TraceEnabled) { var t = Environment.TickCount64; NodeTrace[nodeId] = (t, NodeStreak(nodeId, t), true); }
-            foreach (var edge in flow.Edges) {
-                if (edge.FromNodeId == nodeId) {
-                    if (TraceEnabled) { var t = Environment.TickCount64; EdgeTrace[edge.Id] = (t, EdgeStreak(edge.Id, t)); }
-                    var r = Walk(flow, edge.ToNodeId, new HashSet<string>(visited));
-                    if (r.HasValue) return r;
-                }
-            }
-            return node.ActionId;
+            return node.ActionId; // first action found — return immediately, don't recurse
         }
 
+        // Trigger / Group
         if (TraceEnabled) { var t = Environment.TickCount64; NodeTrace[nodeId] = (t, NodeStreak(nodeId, t), null); }
         foreach (var edge in flow.Edges) {
-            if (edge.FromNodeId == nodeId) {
-                if (TraceEnabled) { var t = Environment.TickCount64; EdgeTrace[edge.Id] = (t, EdgeStreak(edge.Id, t)); }
-                var r = Walk(flow, edge.ToNodeId, new HashSet<string>(visited));
-                if (r.HasValue) return r;
-            }
+            if (edge.FromNodeId != nodeId) continue;
+            if (TraceEnabled) { var t = Environment.TickCount64; EdgeTrace[edge.Id] = (t, EdgeStreak(edge.Id, t)); }
+            var r = WalkFromNode(flow, edge.ToNodeId, new HashSet<string>(visited));
+            if (r.HasValue) return r;
         }
         return null;
     }
