@@ -16,7 +16,7 @@ public sealed class Plugin : IDalamudPlugin {
     [PluginService] internal static IFramework              Framework          { get; private set; } = null!;
     [PluginService] internal static IDtrBar                 DtrBar             { get; private set; } = null!;
     [PluginService] internal static IGameInteropProvider    GameInteropProvider { get; private set; } = null!;
-    [PluginService] internal static IDataManager            DataManager        { get; private set; } = null!;
+    [PluginService] internal static IDataManager            DataManager         { get; private set; } = null!;
 
     private readonly Configuration    _config;
     private readonly WindowSystem     _windowSystem = new("ExCombo");
@@ -61,6 +61,7 @@ public sealed class Plugin : IDalamudPlugin {
 
     private void OnFrameworkUpdate(IFramework _) {
         _dtrEntry.Shown = _config.ShowDtrEntry;
+        FlowExecutor.Tick(_config.Flows);
     }
 
     public void Dispose() {
