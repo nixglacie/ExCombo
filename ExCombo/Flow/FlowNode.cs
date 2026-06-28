@@ -2,11 +2,17 @@ using System;
 
 namespace ExCombo.Flow;
 
-public enum NodeType { }
+public enum NodeType {
+    Trigger = 0,
+    Action  = 1,
+}
 
 public class FlowNode {
-    public string   Id   { get; set; } = Guid.NewGuid().ToString();
-    public NodeType Type { get; set; }
-    public float    X    { get; set; } = 100f;
-    public float    Y    { get; set; } = 100f;
+    public string   Id          { get; set; } = Guid.NewGuid().ToString();
+    public NodeType Type        { get; set; }
+    public float    X           { get; set; } = 100f;
+    public float    Y           { get; set; } = 100f;
+    public uint     ActionId    { get; set; }
+    public string   ActionLabel { get; set; } = "";
+    public uint     IconId      { get; set; }
 }

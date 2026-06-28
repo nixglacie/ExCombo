@@ -9,12 +9,14 @@ using ExCombo.Windows;
 namespace ExCombo;
 
 public sealed class Plugin : IDalamudPlugin {
-    [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
-    [PluginService] internal static ICommandManager        CommandManager  { get; private set; } = null!;
-    [PluginService] internal static ITextureProvider       TextureProvider { get; private set; } = null!;
-    [PluginService] internal static IPluginLog             Log             { get; private set; } = null!;
-    [PluginService] internal static IFramework             Framework       { get; private set; } = null!;
-    [PluginService] internal static IDtrBar                DtrBar          { get; private set; } = null!;
+    [PluginService] internal static IDalamudPluginInterface PluginInterface    { get; private set; } = null!;
+    [PluginService] internal static ICommandManager         CommandManager     { get; private set; } = null!;
+    [PluginService] internal static ITextureProvider        TextureProvider    { get; private set; } = null!;
+    [PluginService] internal static IPluginLog              Log                { get; private set; } = null!;
+    [PluginService] internal static IFramework              Framework          { get; private set; } = null!;
+    [PluginService] internal static IDtrBar                 DtrBar             { get; private set; } = null!;
+    [PluginService] internal static IGameInteropProvider    GameInteropProvider { get; private set; } = null!;
+    [PluginService] internal static IDataManager            DataManager        { get; private set; } = null!;
 
     private readonly Configuration    _config;
     private readonly WindowSystem     _windowSystem = new("ExCombo");
@@ -22,11 +24,13 @@ public sealed class Plugin : IDalamudPlugin {
     private readonly FlowEditorWindow _editorWindow;
     private readonly ConfigWindow     _configWindow;
     private readonly IDtrBarEntry     _dtrEntry;
+    private readonly ActionHook       _actionHook;
 
     private const string Command = "/excombo";
 
     public Plugin() {
-        _config = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        _config     = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        _actionHook = new ActionHook(_config);
 
         _editorWindow = new FlowEditorWindow(_config);
         _configWindow = new ConfigWindow(_config);
@@ -60,6 +64,7 @@ public sealed class Plugin : IDalamudPlugin {
     }
 
     public void Dispose() {
+        _actionHook.Dispose();
         _dtrEntry.Remove();
         Framework.Update                       -= OnFrameworkUpdate;
         PluginInterface.UiBuilder.Draw         -= _windowSystem.Draw;
