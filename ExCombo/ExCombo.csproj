@@ -7,4 +7,10 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <OutputPath>bin\$(Configuration)\</OutputPath>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="icon.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
 </Project>

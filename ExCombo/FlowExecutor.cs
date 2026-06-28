@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using ExCombo.Flow;
 using FFXIVClientStructs.FFXIV.Client.Game;
@@ -8,30 +9,32 @@ internal static class FlowExecutor {
     private sealed class FlowRunState {
         public List<FlowNode> Chain        = [];
         public int            Index        = 0;
-        public uint           QueuedAction = 0;
+        public bool           PendingFire  = false;
+        public uint           FrozenReturn = 0;
+        public long           LastPressedTick = 0; // Environment.TickCount64 at last press
     }
 
-    // Key = "flowId:triggerId" — one state per trigger node, not per flow.
-    private static readonly Dictionary<string, FlowRunState> _states         = new();
-    private static          float                            _prevComboTimer = 0f;
+    private static readonly Dictionary<string, FlowRunState> _states = new();
 
-    // Set by ActionHook before calling UseAction original when a5==1.
-    // Tells Resolve to return QueuedAction instead of chain[Index].
+    private const long ResetAfterMs = 15_000;
+
+    // Set by ActionHook while inside UseAction(a5=1) original call.
+    // Lets Resolve pass through unrelated triggers without replacing them.
     public static bool InQueueExecute = false;
 
-    public static unsafe void Tick(List<ComboFlow> flows) {
-        var timer = ActionManager.Instance()->Combo.Timer;
-
-        if (_prevComboTimer > 0f && timer <= 0f) {
-            foreach (var flow in flows)
-                foreach (var trigger in flow.Nodes)
-                    if (trigger.Type == NodeType.Trigger && _states.TryGetValue(Key(flow, trigger), out var s)) {
-                        s.Index        = 0;
-                        s.QueuedAction = 0;
-                    }
-        }
-
-        _prevComboTimer = timer;
+    // Called every frame. Resets each trigger independently after ResetAfterMs of inactivity.
+    public static void Tick(List<ComboFlow> flows) {
+        var now = Environment.TickCount64;
+        foreach (var flow in flows)
+            foreach (var trigger in flow.Nodes)
+                if (trigger.Type == NodeType.Trigger && _states.TryGetValue(Key(flow, trigger), out var s)
+                    && s.LastPressedTick > 0 && (now - s.LastPressedTick) > ResetAfterMs) {
+                    Plugin.Log.Debug($"[ExCombo][Tick] trigger={trigger.ActionId} inactive {ResetAfterMs}ms, resetting");
+                    s.Index           = 0;
+                    s.PendingFire     = false;
+                    s.FrozenReturn    = 0;
+                    s.LastPressedTick = 0;
+                }
     }
 
     public static uint Resolve(ComboFlow flow, FlowNode trigger, uint triggerActionId) {
@@ -40,12 +43,13 @@ internal static class FlowExecutor {
 
         var state = GetOrCreate(flow, trigger, chain);
 
-        if (InQueueExecute) {
-            // Only override when WE queued this action via direct button press.
-            // If QueuedAction==0 another chain's action happens to share this trigger's
-            // ActionId — let the original action pass through unchanged.
-            return state.QueuedAction != 0 ? state.QueuedAction : triggerActionId;
-        }
+        // During a5=1: if this trigger has no pending queued action, pass through.
+        // This prevents double-replacement when chain[N] happens to be another trigger.
+        if (InQueueExecute && !state.PendingFire) return triggerActionId;
+
+        // Freeze return value while a queued action is pending.
+        // Prevents frame-by-frame drift after Index advanced but before action fires.
+        if (state.PendingFire) return state.FrozenReturn;
 
         return chain[state.Index].ActionId;
     }
@@ -59,22 +63,29 @@ internal static class FlowExecutor {
     public static void NotifyPressed(ComboFlow flow, FlowNode trigger) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
         var before = state.Index;
-        state.Index = (state.Index + 1) % state.Chain.Count;
-        Plugin.Log.Debug($"[ExCombo][Advance] trigger={trigger.ActionId} {before}→{state.Index} (chain={state.Chain.Count})");
+        state.Index           = (state.Index + 1) % state.Chain.Count;
+        state.LastPressedTick = Environment.TickCount64;
+        Plugin.Log.Debug($"[ExCombo][Advance] trigger={trigger.ActionId} {before}→{state.Index} (chain={state.Chain.Count}) immediate");
     }
 
-    public static void SaveQueuedAction(ComboFlow flow, FlowNode trigger, uint action) {
-        if (_states.TryGetValue(Key(flow, trigger), out var state)) {
-            state.QueuedAction = action;
-            Plugin.Log.Debug($"[ExCombo][Queue] trigger={trigger.ActionId} saved={action}");
-        }
+    public static void NotifyQueued(ComboFlow flow, FlowNode trigger, uint frozenReturn) {
+        if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
+        state.PendingFire     = true;
+        state.FrozenReturn    = frozenReturn;
+        state.LastPressedTick = Environment.TickCount64;
+        Plugin.Log.Debug($"[ExCombo][Queue] trigger={trigger.ActionId} frozen={frozenReturn} idx={state.Index}");
     }
 
-    public static void ClearQueuedAction(ComboFlow flow, FlowNode trigger) {
-        if (_states.TryGetValue(Key(flow, trigger), out var state)) {
-            Plugin.Log.Debug($"[ExCombo][Queue] trigger={trigger.ActionId} cleared");
-            state.QueuedAction = 0;
-        }
+    // No-op if PendingFire=false — prevents spurious advance of unrelated triggers.
+    public static void NotifyFired(ComboFlow flow, FlowNode trigger) {
+        if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
+        if (!state.PendingFire) return;
+        var before = state.Index;
+        state.Index           = (state.Index + 1) % state.Chain.Count;
+        state.PendingFire     = false;
+        state.FrozenReturn    = 0;
+        state.LastPressedTick = Environment.TickCount64;
+        Plugin.Log.Debug($"[ExCombo][Fired] trigger={trigger.ActionId} {before}→{state.Index} (chain={state.Chain.Count})");
     }
 
     public static void InvalidateFlow(string flowId) {
