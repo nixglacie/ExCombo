@@ -17,17 +17,24 @@ public class FlowEditorWindow : Window {
 
     private Vector2 _canvasOffset = Vector2.Zero;
     private string? _wireFromNodeId;
+    private int     _wireFromPortIndex;
     private string? _pickerNodeId;
     private string  _pickerSearch     = "";
     private string  _pickerLastSearch = "\0";
     private readonly List<(uint Id, string Name, uint Icon)> _pickerResults = new();
+    private string? _branchEditNodeId;
+    private int     _branchEditCount;
     private Vector2 _contextMenuCanvasPos;
     private string? _pendingDeleteNodeId;
     private string? _draggingNodeId;
 
-    private static readonly Vector2 NodeSize  = new(64f, 64f);
-    private const           float   PortRadius = 6f;
-    private const           float   GridStep   = 32f;
+    private static readonly Vector2 NodeSize    = new(64f, 64f);
+    private const           float   PortRadius  = 6f;
+    private const           float   GridStep    = 32f;
+    private const           float   BranchSlotH = 32f;
+
+    private static float NodeHeight(FlowNode n) =>
+        n.Type == NodeType.Branch ? MathF.Max(NodeSize.Y, BranchSlotH * n.OutputCount) : NodeSize.Y;
 
     private static uint Col(float r, float g, float b, float a = 1f) =>
         ImGui.ColorConvertFloat4ToU32(new Vector4(r, g, b, a));
@@ -81,8 +88,15 @@ public class FlowEditorWindow : Window {
             var fn = _flow.Nodes.Find(n => n.Id == edge.FromNodeId);
             var tn = _flow.Nodes.Find(n => n.Id == edge.ToNodeId);
             if (fn == null || tn == null) continue;
-            var p1  = canvasMin + _canvasOffset + new Vector2(fn.X + NodeSize.X, fn.Y + NodeSize.Y * 0.5f);
-            var p4  = canvasMin + _canvasOffset + new Vector2(tn.X,              tn.Y + NodeSize.Y * 0.5f);
+
+            Vector2 p1;
+            if (fn.Type == NodeType.Branch) {
+                var slotY = fn.Y + (edge.FromPortIndex + 0.5f) * BranchSlotH;
+                p1 = canvasMin + _canvasOffset + new Vector2(fn.X + NodeSize.X, slotY);
+            } else {
+                p1 = canvasMin + _canvasOffset + new Vector2(fn.X + NodeSize.X, fn.Y + NodeSize.Y * 0.5f);
+            }
+            var p4  = canvasMin + _canvasOffset + new Vector2(tn.X, tn.Y + NodeHeight(tn) * 0.5f);
             var cp1 = p1 + new Vector2(60, 0);
             var cp2 = p4 - new Vector2(60, 0);
             dl.AddBezierCubic(p1, cp1, cp2, p4, Col(0.4f, 0.6f, 1f, 0.85f), 2f);
@@ -98,19 +112,29 @@ public class FlowEditorWindow : Window {
             dl.AddLine(mid + new Vector2(Bx, -Bx), mid + new Vector2(-Bx, Bx), Col(1f, 1f, 1f, 0.9f), 1.5f);
             if (btnHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) edgeToDelete = edge;
         }
-        if (edgeToDelete != null) { _flow.Edges.Remove(edgeToDelete); _config.Save(); }
+        if (edgeToDelete != null) {
+            _flow.Edges.Remove(edgeToDelete);
+            FlowExecutor.InvalidateFlow(_flow.Id);
+            _config.Save();
+        }
 
         // ── Pending wire ──────────────────────────────────────────────────
         if (_wireFromNodeId != null) {
             var wireMouse = ImGui.GetMousePos();
             var wfn       = _flow.Nodes.Find(n => n.Id == _wireFromNodeId);
             if (wfn != null) {
-                var p1      = canvasMin + _canvasOffset + new Vector2(wfn.X + NodeSize.X, wfn.Y + NodeSize.Y * 0.5f);
+                Vector2 p1;
+                if (wfn.Type == NodeType.Branch) {
+                    var slotY = wfn.Y + (_wireFromPortIndex + 0.5f) * BranchSlotH;
+                    p1 = canvasMin + _canvasOffset + new Vector2(wfn.X + NodeSize.X, slotY);
+                } else {
+                    p1 = canvasMin + _canvasOffset + new Vector2(wfn.X + NodeSize.X, wfn.Y + NodeSize.Y * 0.5f);
+                }
                 var wireEnd = wireMouse;
                 foreach (var t in _flow.Nodes) {
                     if (t.Id == _wireFromNodeId) continue;
                     if (t.Type == NodeType.Trigger) continue;
-                    var tip = canvasMin + _canvasOffset + new Vector2(t.X, t.Y + NodeSize.Y * 0.5f);
+                    var tip = canvasMin + _canvasOffset + new Vector2(t.X, t.Y + NodeHeight(t) * 0.5f);
                     if (Vector2.Distance(wireMouse, tip) < PortRadius * 3f) { wireEnd = tip; break; }
                 }
                 dl.AddBezierCubic(p1, p1 + new Vector2(60, 0), wireEnd - new Vector2(60, 0), wireEnd,
@@ -121,11 +145,22 @@ public class FlowEditorWindow : Window {
                 foreach (var t in _flow.Nodes) {
                     if (t.Id == _wireFromNodeId) continue;
                     if (t.Type == NodeType.Trigger) continue;
-                    var tip = canvasMin + _canvasOffset + new Vector2(t.X, t.Y + NodeSize.Y * 0.5f);
+                    var tip = canvasMin + _canvasOffset + new Vector2(t.X, t.Y + NodeHeight(t) * 0.5f);
                     if (Vector2.Distance(wireMouse, tip) < PortRadius * 3f) {
-                        if (!_flow.Edges.Exists(e => e.FromNodeId == _wireFromNodeId && e.ToNodeId == t.Id))
-                            _flow.Edges.Add(new FlowEdge { FromNodeId = _wireFromNodeId, ToNodeId = t.Id });
-                        _config.Save();
+                        // prevent duplicate edge on same port
+                        if (!_flow.Edges.Exists(e => e.FromNodeId == _wireFromNodeId
+                                                   && e.FromPortIndex == _wireFromPortIndex
+                                                   && e.ToNodeId == t.Id)) {
+                            _flow.Edges.RemoveAll(e => e.FromNodeId == _wireFromNodeId
+                                                    && e.FromPortIndex == _wireFromPortIndex);
+                            _flow.Edges.Add(new FlowEdge {
+                                FromNodeId    = _wireFromNodeId,
+                                ToNodeId      = t.Id,
+                                FromPortIndex = _wireFromPortIndex,
+                            });
+                            FlowExecutor.InvalidateFlow(_flow.Id);
+                            _config.Save();
+                        }
                         break;
                     }
                 }
@@ -134,19 +169,40 @@ public class FlowEditorWindow : Window {
         }
 
         // ── Nodes ─────────────────────────────────────────────────────────
+        var anyNodeRightClicked = false;
 
         foreach (var node in _flow.Nodes) {
-            var sp      = canvasMin + _canvasOffset + new Vector2(node.X, node.Y);
-            var outPort = sp + new Vector2(NodeSize.X, NodeSize.Y * 0.5f);
-            var inPort  = sp + new Vector2(0f,         NodeSize.Y * 0.5f);
-            var overOutPort = _wireFromNodeId == null
-                && Vector2.Distance(mouse2, outPort) < PortRadius * 2f;
+            var isTrigger = node.Type == NodeType.Trigger;
+            var isBranch  = node.Type == NodeType.Branch;
+            var nodeH     = NodeHeight(node);
+            var sp        = canvasMin + _canvasOffset + new Vector2(node.X, node.Y);
+            var inPort    = sp + new Vector2(0f, nodeH * 0.5f);
+
+            // ── Output port hover detection ───────────────────────────────
+            bool overOutPort    = false;
+            int  overOutPortIdx = 0;
+            if (isBranch) {
+                if (_wireFromNodeId == null) {
+                    for (var p = 0; p < node.OutputCount; p++) {
+                        var portPos = sp + new Vector2(NodeSize.X, (p + 0.5f) * BranchSlotH);
+                        if (Vector2.Distance(mouse2, portPos) < PortRadius * 2f) {
+                            overOutPort    = true;
+                            overOutPortIdx = p;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                var outPort = sp + new Vector2(NodeSize.X, NodeSize.Y * 0.5f);
+                overOutPort = _wireFromNodeId == null && Vector2.Distance(mouse2, outPort) < PortRadius * 2f;
+            }
 
             ImGui.SetCursorScreenPos(sp);
-            ImGui.InvisibleButton($"node_{node.Id}", NodeSize);
+            ImGui.InvisibleButton($"node_{node.Id}", new Vector2(NodeSize.X, nodeH));
             var nodeHovered = ImGui.IsItemHovered();
             var nodeActive  = ImGui.IsItemActive();
 
+            // ── Drag ──────────────────────────────────────────────────────
             if (nodeActive && ImGui.IsMouseDragging(ImGuiMouseButton.Left) && _wireFromNodeId != node.Id) {
                 _draggingNodeId = node.Id;
                 var delta = ImGui.GetIO().MouseDelta;
@@ -160,71 +216,139 @@ public class FlowEditorWindow : Window {
                 _config.Save();
             }
 
-            if (overOutPort && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
-                _wireFromNodeId = node.Id;
+            // ── Wire start ────────────────────────────────────────────────
+            if (overOutPort && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
+                _wireFromNodeId    = node.Id;
+                _wireFromPortIndex = isBranch ? overOutPortIdx : 0;
+            }
 
-            if (nodeHovered && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left))
-                OpenPicker(node.Id);
+            if (nodeHovered && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
+                if (isBranch) OpenBranchEdit(node.Id, node.OutputCount);
+                else          OpenPicker(node.Id);
+            }
 
-            if (nodeHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
+            if (nodeHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
                 ImGui.OpenPopup($"node_ctx_{node.Id}");
+                anyNodeRightClicked = true;
+            }
 
             // ── Draw node ─────────────────────────────────────────────────
-            var isTrigger = node.Type == NodeType.Trigger;
-            // --success #a2da8c (trigger), --accent #74c3ff (action)
-            var accentR   = isTrigger ? 0.635f : 0.455f;
-            var accentG   = isTrigger ? 0.855f : 0.765f;
-            var accentB   = isTrigger ? 0.549f : 1.000f;
-            var bgCol     = isTrigger ? Col(0.09f, 0.13f, 0.10f) : Col(0.09f, 0.11f, 0.16f);
-            var borderCol = nodeHovered || nodeActive
-                ? Col(accentR, accentG, accentB)
-                : Col(accentR, accentG, accentB, 0.5f);
-            dl.AddRectFilled(sp, sp + NodeSize, bgCol, 6f);
+            if (isBranch) {
+                var borderCol = nodeHovered || nodeActive
+                    ? Col(0.70f, 0.40f, 1.00f)
+                    : Col(0.70f, 0.40f, 1.00f, 0.5f);
+                dl.AddRectFilled(sp, sp + new Vector2(NodeSize.X, nodeH), Col(0.08f, 0.05f, 0.12f), 6f);
+                dl.AddRect(sp, sp + new Vector2(NodeSize.X, nodeH), borderCol, 6f, ImDrawFlags.None,
+                    nodeHovered ? 2f : 1.5f);
 
-            if (node.IconId != 0) {
-                var tex = Plugin.TextureProvider
-                    .GetFromGameIcon(new GameIconLookup(node.IconId))?.GetWrapOrDefault();
-                if (tex != null)
-                    DrawHelpers.DrawIcon(dl, tex, sp, NodeSize, 1f);
-            }
+                var label      = "Branch";
+                var labelWidth = ImGui.CalcTextSize(label).X;
+                var labelPos   = sp + new Vector2((NodeSize.X - labelWidth) * 0.5f, -16f);
+                DrawHelpers.DrawText(dl, labelPos, label, Col(0.70f, 0.40f, 1.00f), true);
 
-            dl.AddRect(sp, sp + NodeSize, borderCol, 6f, ImDrawFlags.None, nodeHovered ? 2f : 1.5f);
-
-            var label      = node.ActionLabel != "" ? node.ActionLabel : (isTrigger ? "Trigger" : "Action");
-            var labelWidth = ImGui.CalcTextSize(label).X;
-            var labelPos   = sp + new Vector2((NodeSize.X - labelWidth) * 0.5f, -16f);
-            DrawHelpers.DrawText(dl, labelPos, label, Col(accentR, accentG, accentB), true);
-
-            // ── Delete button (top-right, visible on hover) ───────────────
-            if (nodeHovered) {
-                var xBtn = sp + new Vector2(NodeSize.X - 7f, 7f);
-                const float XBr = 7f;
-                const float XS  = 3f;
-                var xHov = Vector2.Distance(mouse2, xBtn) < XBr;
-                dl.AddCircleFilled(xBtn, XBr, xHov ? Col(0.75f, 0.15f, 0.15f) : Col(0.20f, 0.08f, 0.08f, 0.9f));
-                dl.AddCircle(xBtn, XBr, Col(1f, 0.3f, 0.3f, 0.8f), 12, 1.2f);
-                dl.AddLine(xBtn + new Vector2(-XS, -XS), xBtn + new Vector2(XS, XS), Col(1f, 1f, 1f, 0.9f), 1.5f);
-                dl.AddLine(xBtn + new Vector2(XS, -XS), xBtn + new Vector2(-XS, XS), Col(1f, 1f, 1f, 0.9f), 1.5f);
-                if (xHov && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
-                    _pendingDeleteNodeId = node.Id;
-            }
-
-            // ports
-            if (!isTrigger) {
+                // Input port (left midpoint)
                 var overInPort = _wireFromNodeId != null && _wireFromNodeId != node.Id
                     && Vector2.Distance(mouse2, inPort) < PortRadius * 3f;
                 dl.AddCircleFilled(inPort, PortRadius, overInPort ? Col(0.3f, 0.9f, 0.3f) : Col(0.25f, 0.25f, 0.35f));
                 dl.AddCircle(inPort, PortRadius, overInPort ? Col(0.4f, 1f, 0.4f) : Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
-            }
-            dl.AddCircleFilled(outPort, PortRadius, overOutPort ? Col(0.6f, 0.8f, 1f) : Col(0.25f, 0.25f, 0.35f));
-            dl.AddCircle(outPort, PortRadius, Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
 
-            // node context menu
+                // Output ports
+                for (var p = 0; p < node.OutputCount; p++) {
+                    var portPos     = sp + new Vector2(NodeSize.X, (p + 0.5f) * BranchSlotH);
+                    var portHovered = overOutPort && overOutPortIdx == p;
+                    dl.AddCircleFilled(portPos, PortRadius,
+                        portHovered ? Col(0.6f, 0.8f, 1f) : Col(0.25f, 0.25f, 0.35f));
+                    dl.AddCircle(portPos, PortRadius, Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
+
+                    // Port label (1-based) to the left of port
+                    var numLabel = (p + 1).ToString();
+                    var numW     = ImGui.CalcTextSize(numLabel).X;
+                    DrawHelpers.DrawText(dl, portPos + new Vector2(-numW - PortRadius - 4f, -7f),
+                        numLabel, Col(0.70f, 0.40f, 1.00f, 0.8f), false);
+
+                    // Divider line between slots (except after last)
+                    if (p < node.OutputCount - 1) {
+                        var lineY = sp.Y + (p + 1) * BranchSlotH;
+                        dl.AddLine(new Vector2(sp.X + 4f, lineY), new Vector2(sp.X + NodeSize.X - 4f, lineY),
+                            Col(0.70f, 0.40f, 1.00f, 0.2f), 1f);
+                    }
+                }
+
+                // Delete button (top-right)
+                if (nodeHovered) {
+                    var xBtn = sp + new Vector2(NodeSize.X - 7f, 7f);
+                    const float XBr = 7f;
+                    const float XS  = 3f;
+                    var xHov = Vector2.Distance(mouse2, xBtn) < XBr;
+                    dl.AddCircleFilled(xBtn, XBr, xHov ? Col(0.75f, 0.15f, 0.15f) : Col(0.20f, 0.08f, 0.08f, 0.9f));
+                    dl.AddCircle(xBtn, XBr, Col(1f, 0.3f, 0.3f, 0.8f), 12, 1.2f);
+                    dl.AddLine(xBtn + new Vector2(-XS, -XS), xBtn + new Vector2(XS, XS), Col(1f, 1f, 1f, 0.9f), 1.5f);
+                    dl.AddLine(xBtn + new Vector2(XS, -XS), xBtn + new Vector2(-XS, XS), Col(1f, 1f, 1f, 0.9f), 1.5f);
+                    if (xHov && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+                        _pendingDeleteNodeId = node.Id;
+                }
+            } else {
+                // ── Trigger / Action node draw ────────────────────────────
+                var outPort   = sp + new Vector2(NodeSize.X, NodeSize.Y * 0.5f);
+                var accentR   = isTrigger ? 0.635f : 0.455f;
+                var accentG   = isTrigger ? 0.855f : 0.765f;
+                var accentB   = isTrigger ? 0.549f : 1.000f;
+                var bgCol     = isTrigger ? Col(0.09f, 0.13f, 0.10f) : Col(0.09f, 0.11f, 0.16f);
+                var borderCol = nodeHovered || nodeActive
+                    ? Col(accentR, accentG, accentB)
+                    : Col(accentR, accentG, accentB, 0.5f);
+                dl.AddRectFilled(sp, sp + NodeSize, bgCol, 6f);
+
+                if (node.IconId != 0) {
+                    var tex = Plugin.TextureProvider
+                        .GetFromGameIcon(new GameIconLookup(node.IconId))?.GetWrapOrDefault();
+                    if (tex != null)
+                        DrawHelpers.DrawIcon(dl, tex, sp, NodeSize, 1f);
+                }
+
+                dl.AddRect(sp, sp + NodeSize, borderCol, 6f, ImDrawFlags.None, nodeHovered ? 2f : 1.5f);
+
+                var label      = node.ActionLabel != "" ? node.ActionLabel : (isTrigger ? "Trigger" : "Action");
+                var labelWidth = ImGui.CalcTextSize(label).X;
+                var labelPos   = sp + new Vector2((NodeSize.X - labelWidth) * 0.5f, -16f);
+                DrawHelpers.DrawText(dl, labelPos, label, Col(accentR, accentG, accentB), true);
+
+                // Delete button (top-right, visible on hover)
+                if (nodeHovered) {
+                    var xBtn = sp + new Vector2(NodeSize.X - 7f, 7f);
+                    const float XBr = 7f;
+                    const float XS  = 3f;
+                    var xHov = Vector2.Distance(mouse2, xBtn) < XBr;
+                    dl.AddCircleFilled(xBtn, XBr, xHov ? Col(0.75f, 0.15f, 0.15f) : Col(0.20f, 0.08f, 0.08f, 0.9f));
+                    dl.AddCircle(xBtn, XBr, Col(1f, 0.3f, 0.3f, 0.8f), 12, 1.2f);
+                    dl.AddLine(xBtn + new Vector2(-XS, -XS), xBtn + new Vector2(XS, XS), Col(1f, 1f, 1f, 0.9f), 1.5f);
+                    dl.AddLine(xBtn + new Vector2(XS, -XS), xBtn + new Vector2(-XS, XS), Col(1f, 1f, 1f, 0.9f), 1.5f);
+                    if (xHov && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+                        _pendingDeleteNodeId = node.Id;
+                }
+
+                // Ports
+                if (!isTrigger) {
+                    var overInPort = _wireFromNodeId != null && _wireFromNodeId != node.Id
+                        && Vector2.Distance(mouse2, inPort) < PortRadius * 3f;
+                    dl.AddCircleFilled(inPort, PortRadius, overInPort ? Col(0.3f, 0.9f, 0.3f) : Col(0.25f, 0.25f, 0.35f));
+                    dl.AddCircle(inPort, PortRadius, overInPort ? Col(0.4f, 1f, 0.4f) : Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
+                }
+                dl.AddCircleFilled(outPort, PortRadius, overOutPort ? Col(0.6f, 0.8f, 1f) : Col(0.25f, 0.25f, 0.35f));
+                dl.AddCircle(outPort, PortRadius, Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
+            }
+
+            // ── Context menu ──────────────────────────────────────────────
             if (ImGui.BeginPopup($"node_ctx_{node.Id}")) {
-                if (ImGui.MenuItem("Edit Action")) OpenPicker(node.Id);
+                if (isBranch) {
+                    if (ImGui.MenuItem("Edit Outputs")) OpenBranchEdit(node.Id, node.OutputCount);
+                } else {
+                    if (ImGui.MenuItem("Edit Action")) OpenPicker(node.Id);
+                }
                 if (ImGui.MenuItem("Delete Node")) _pendingDeleteNodeId = node.Id;
                 if (ImGui.MenuItem("Remove Wires")) {
                     _flow.Edges.RemoveAll(e => e.FromNodeId == node.Id || e.ToNodeId == node.Id);
+                    FlowExecutor.InvalidateFlow(_flow.Id);
                     _config.Save();
                 }
                 ImGui.EndPopup();
@@ -235,6 +359,7 @@ public class FlowEditorWindow : Window {
         if (_pendingDeleteNodeId != null) {
             _flow.Edges.RemoveAll(e => e.FromNodeId == _pendingDeleteNodeId || e.ToNodeId == _pendingDeleteNodeId);
             _flow.Nodes.RemoveAll(n => n.Id == _pendingDeleteNodeId);
+            FlowExecutor.InvalidateFlow(_flow.Id);
             _config.Save();
             _pendingDeleteNodeId = null;
         }
@@ -242,13 +367,14 @@ public class FlowEditorWindow : Window {
         // ── Canvas input (submitted after nodes so nodes win HoveredId) ───
         ImGui.SetCursorScreenPos(canvasMin);
         ImGui.InvisibleButton("##canvas", canvasSize, ImGuiButtonFlags.MouseButtonRight);
-        if (ImGui.IsItemHovered() && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
+        if (!anyNodeRightClicked && ImGui.IsItemHovered() && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
             _contextMenuCanvasPos = mouse2 - canvasMin - _canvasOffset;
             ImGui.OpenPopup("##canvas_ctx");
         }
         if (ImGui.BeginPopup("##canvas_ctx")) {
             if (ImGui.MenuItem("Add Trigger")) AddNode(NodeType.Trigger);
             if (ImGui.MenuItem("Add Action"))  AddNode(NodeType.Action);
+            if (ImGui.MenuItem("Add Branch"))  AddNode(NodeType.Branch);
             ImGui.EndPopup();
         }
 
@@ -259,6 +385,7 @@ public class FlowEditorWindow : Window {
 
         // ── Action picker modal ───────────────────────────────────────────
         DrawActionPicker();
+        DrawBranchEdit();
     }
 
     private void AddNode(NodeType type) {
@@ -269,7 +396,49 @@ public class FlowEditorWindow : Window {
         };
         _flow!.Nodes.Add(node);
         _config.Save();
-        OpenPicker(node.Id);
+        if (type != NodeType.Branch)
+            OpenPicker(node.Id);
+    }
+
+    private void OpenBranchEdit(string nodeId, int currentCount) {
+        _branchEditNodeId = nodeId;
+        _branchEditCount  = currentCount;
+        ImGui.OpenPopup("Branch Outputs##branchedit");
+    }
+
+    private void DrawBranchEdit() {
+        if (_branchEditNodeId == null) return;
+
+        ImGui.SetNextWindowSize(new Vector2(260, 110), ImGuiCond.Always);
+        if (!ImGui.BeginPopupModal("Branch Outputs##branchedit")) return;
+
+        ImGui.Text("Output count:");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(80f);
+        ImGui.InputInt("##outcount", ref _branchEditCount);
+        if (_branchEditCount < 2) _branchEditCount = 2;
+        if (_branchEditCount > 16) _branchEditCount = 16;
+
+        ImGui.Spacing();
+        if (ImGui.Button("OK", new Vector2(100f, 0f))) {
+            var node = _flow!.Nodes.Find(n => n.Id == _branchEditNodeId);
+            if (node != null) {
+                // remove edges on ports being deleted
+                for (var p = _branchEditCount; p < node.OutputCount; p++)
+                    _flow.Edges.RemoveAll(e => e.FromNodeId == node.Id && e.FromPortIndex == p);
+                node.OutputCount = _branchEditCount;
+                FlowExecutor.InvalidateFlow(_flow.Id);
+                _config.Save();
+            }
+            _branchEditNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Cancel", new Vector2(100f, 0f))) {
+            _branchEditNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.EndPopup();
     }
 
     private void OpenPicker(string nodeId) {
@@ -312,6 +481,7 @@ public class FlowEditorWindow : Window {
                         node.ActionId    = id;
                         node.ActionLabel = name;
                         node.IconId      = icon;
+                        FlowExecutor.InvalidateFlow(_flow.Id);
                         _config.Save();
                     }
                     _pickerNodeId = null;

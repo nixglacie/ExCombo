@@ -7,11 +7,18 @@ namespace ExCombo;
 
 internal static class FlowExecutor {
     private sealed class FlowRunState {
-        public List<FlowNode> Chain        = [];
-        public int            Index        = 0;
-        public bool           PendingFire  = false;
-        public uint           FrozenReturn = 0;
-        public long           LastPressedTick = 0; // Environment.TickCount64 at last press
+        public string  NextActionId      = "";
+        public string? CurrentBranchId   = null;
+        public int     CurrentBranchPort = 0;
+        public readonly Dictionary<string, BranchNodeState> BranchStates = new();
+        public bool    PendingFire       = false;
+        public uint    FrozenReturn      = 0;
+        public long    LastPressedTick   = 0;
+    }
+
+    private sealed class BranchNodeState {
+        public int ActivePort = -1;
+        public int PortIndex  = 0;
     }
 
     private static readonly Dictionary<string, FlowRunState> _states = new();
@@ -19,10 +26,8 @@ internal static class FlowExecutor {
     private const long ResetAfterMs = 15_000;
 
     // Set by ActionHook while inside UseAction(a5=1) original call.
-    // Lets Resolve pass through unrelated triggers without replacing them.
     public static bool InQueueExecute = false;
 
-    // Called every frame. Resets each trigger independently after ResetAfterMs of inactivity.
     public static void Tick(List<ComboFlow> flows) {
         var now = Environment.TickCount64;
         foreach (var flow in flows)
@@ -30,42 +35,34 @@ internal static class FlowExecutor {
                 if (trigger.Type == NodeType.Trigger && _states.TryGetValue(Key(flow, trigger), out var s)
                     && s.LastPressedTick > 0 && (now - s.LastPressedTick) > ResetAfterMs) {
                     Plugin.Log.Debug($"[ExCombo][Tick] trigger={trigger.ActionId} inactive {ResetAfterMs}ms, resetting");
-                    s.Index           = 0;
-                    s.PendingFire     = false;
-                    s.FrozenReturn    = 0;
-                    s.LastPressedTick = 0;
+                    ResetState(s);
                 }
     }
 
     public static uint Resolve(ComboFlow flow, FlowNode trigger, uint triggerActionId) {
-        var chain = GetChain(flow, trigger);
-        if (chain.Count == 0) return triggerActionId;
+        var state = GetOrCreate(flow, trigger);
 
-        var state = GetOrCreate(flow, trigger, chain);
+        if (state.NextActionId == "")
+            FindInitialAction(flow, trigger, state);
 
-        // During a5=1: if this trigger has no pending queued action, pass through.
-        // This prevents double-replacement when chain[N] happens to be another trigger.
         if (InQueueExecute && !state.PendingFire) return triggerActionId;
-
-        // Freeze return value while a queued action is pending.
-        // Prevents frame-by-frame drift after Index advanced but before action fires.
         if (state.PendingFire) return state.FrozenReturn;
 
-        return chain[state.Index].ActionId;
+        var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
+        return node?.ActionId ?? triggerActionId;
     }
 
     public static uint GetCurrentChainAction(ComboFlow flow, FlowNode trigger) {
-        if (!_states.TryGetValue(Key(flow, trigger), out var state) || state.Chain.Count == 0) return 0;
-        var idx = state.Index >= state.Chain.Count ? 0 : state.Index;
-        return state.Chain[idx].ActionId;
+        if (!_states.TryGetValue(Key(flow, trigger), out var state) || state.NextActionId == "") return 0;
+        return flow.Nodes.Find(n => n.Id == state.NextActionId)?.ActionId ?? 0;
     }
 
     public static void NotifyPressed(ComboFlow flow, FlowNode trigger) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
-        var before = state.Index;
-        state.Index           = (state.Index + 1) % state.Chain.Count;
         state.LastPressedTick = Environment.TickCount64;
-        Plugin.Log.Debug($"[ExCombo][Advance] trigger={trigger.ActionId} {before}→{state.Index} (chain={state.Chain.Count}) immediate");
+        var before = state.NextActionId;
+        AdvanceState(flow, trigger, state);
+        Plugin.Log.Debug($"[ExCombo][Advance] trigger={trigger.ActionId} {before}→{state.NextActionId} immediate");
     }
 
     public static void NotifyQueued(ComboFlow flow, FlowNode trigger, uint frozenReturn) {
@@ -73,19 +70,18 @@ internal static class FlowExecutor {
         state.PendingFire     = true;
         state.FrozenReturn    = frozenReturn;
         state.LastPressedTick = Environment.TickCount64;
-        Plugin.Log.Debug($"[ExCombo][Queue] trigger={trigger.ActionId} frozen={frozenReturn} idx={state.Index}");
+        Plugin.Log.Debug($"[ExCombo][Queue] trigger={trigger.ActionId} frozen={frozenReturn} next={state.NextActionId}");
     }
 
-    // No-op if PendingFire=false — prevents spurious advance of unrelated triggers.
     public static void NotifyFired(ComboFlow flow, FlowNode trigger) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
         if (!state.PendingFire) return;
-        var before = state.Index;
-        state.Index           = (state.Index + 1) % state.Chain.Count;
+        var before            = state.NextActionId;
         state.PendingFire     = false;
         state.FrozenReturn    = 0;
         state.LastPressedTick = Environment.TickCount64;
-        Plugin.Log.Debug($"[ExCombo][Fired] trigger={trigger.ActionId} {before}→{state.Index} (chain={state.Chain.Count})");
+        AdvanceState(flow, trigger, state);
+        Plugin.Log.Debug($"[ExCombo][Fired] trigger={trigger.ActionId} {before}→{state.NextActionId}");
     }
 
     public static void InvalidateFlow(string flowId) {
@@ -95,33 +91,125 @@ internal static class FlowExecutor {
         foreach (var k in toRemove) _states.Remove(k);
     }
 
-    private static FlowRunState GetOrCreate(ComboFlow flow, FlowNode trigger, List<FlowNode> chain) {
+    // ── Graph walker ─────────────────────────────────────────────────────────
+
+    private static void AdvanceState(ComboFlow flow, FlowNode trigger, FlowRunState state) {
+        if (state.CurrentBranchId != null) {
+            if (!state.BranchStates.TryGetValue(state.CurrentBranchId, out var bs)) {
+                state.CurrentBranchId = null;
+                FindInitialAction(flow, trigger, state);
+                return;
+            }
+            bs.PortIndex++;
+            var portChain = GetPortChain(flow, state.CurrentBranchId, bs.ActivePort);
+            if (bs.PortIndex < portChain.Count) {
+                state.NextActionId = portChain[bs.PortIndex].Id;
+            } else {
+                bs.ActivePort         = -1;
+                bs.PortIndex          = 0;
+                state.CurrentBranchId = null;
+                FindInitialAction(flow, trigger, state);
+            }
+        } else {
+            var edge = flow.Edges.Find(e => e.FromNodeId == state.NextActionId && e.FromPortIndex == 0);
+            if (edge == null) { FindInitialAction(flow, trigger, state); return; }
+            var next = flow.Nodes.Find(n => n.Id == edge.ToNodeId);
+            if      (next == null || next.Type == NodeType.Trigger) FindInitialAction(flow, trigger, state);
+            else if (next.Type == NodeType.Action)                  state.NextActionId = next.Id;
+            else if (next.Type == NodeType.Branch)                  EnterBranch(flow, state, next);
+        }
+    }
+
+    private static void FindInitialAction(ComboFlow flow, FlowNode trigger, FlowRunState state) {
+        var edge = flow.Edges.Find(e => e.FromNodeId == trigger.Id && e.FromPortIndex == 0);
+        if (edge == null) { state.NextActionId = ""; return; }
+        var next = flow.Nodes.Find(n => n.Id == edge.ToNodeId);
+        if      (next == null)                  state.NextActionId = "";
+        else if (next.Type == NodeType.Action)  state.NextActionId = next.Id;
+        else if (next.Type == NodeType.Branch)  EnterBranch(flow, state, next);
+        else                                    state.NextActionId = "";
+    }
+
+    private static void EnterBranch(ComboFlow flow, FlowRunState state, FlowNode branchNode) {
+        if (!state.BranchStates.TryGetValue(branchNode.Id, out var bs)) {
+            bs = new BranchNodeState();
+            state.BranchStates[branchNode.Id] = bs;
+        }
+
+        var fallbackPort  = -1;
+        List<FlowNode>? fallbackChain = null;
+
+        for (var port = 0; port < branchNode.OutputCount; port++) {
+            var chain = GetPortChain(flow, branchNode.Id, port);
+            if (chain.Count == 0) continue;
+            if (fallbackPort < 0) { fallbackPort = port; fallbackChain = chain; }
+            if (IsActionUsable(chain[0].ActionId)) {
+                bs.ActivePort           = port;
+                bs.PortIndex            = 0;
+                state.CurrentBranchId   = branchNode.Id;
+                state.CurrentBranchPort = port;
+                state.NextActionId      = chain[0].Id;
+                return;
+            }
+        }
+
+        // No port passed usability check (e.g. GCD just fired) — fall back to first connected port.
+        // Priority selection still activates when cooldowns differ between ports.
+        if (fallbackPort >= 0) {
+            bs.ActivePort           = fallbackPort;
+            bs.PortIndex            = 0;
+            state.CurrentBranchId   = branchNode.Id;
+            state.CurrentBranchPort = fallbackPort;
+            state.NextActionId      = fallbackChain![0].Id;
+        } else {
+            state.NextActionId = "";
+        }
+    }
+
+    private static List<FlowNode> GetPortChain(ComboFlow flow, string branchNodeId, int portIndex) {
+        var chain = new List<FlowNode>();
+        var edge  = flow.Edges.Find(e => e.FromNodeId == branchNodeId && e.FromPortIndex == portIndex);
+        if (edge == null) return chain;
+
+        var current = edge.ToNodeId;
+        var visited = new HashSet<string>();
+        while (!visited.Contains(current)) {
+            visited.Add(current);
+            var node = flow.Nodes.Find(n => n.Id == current);
+            if (node is not { Type: NodeType.Action }) break;
+            chain.Add(node);
+            var next = flow.Edges.Find(e => e.FromNodeId == current && e.FromPortIndex == 0);
+            if (next == null) break;
+            current = next.ToNodeId;
+        }
+        return chain;
+    }
+
+    private static unsafe bool IsActionUsable(uint actionId) {
+        var mgr = ActionManager.Instance();
+        return mgr != null && mgr->GetActionStatus(ActionType.Action, actionId) == 0;
+    }
+
+    private static void ResetState(FlowRunState s) {
+        s.NextActionId    = "";
+        s.CurrentBranchId = null;
+        s.PendingFire     = false;
+        s.FrozenReturn    = 0;
+        s.LastPressedTick = 0;
+        foreach (var bs in s.BranchStates.Values) {
+            bs.ActivePort = -1;
+            bs.PortIndex  = 0;
+        }
+    }
+
+    private static FlowRunState GetOrCreate(ComboFlow flow, FlowNode trigger) {
         var key = Key(flow, trigger);
         if (!_states.TryGetValue(key, out var state)) {
             state = new FlowRunState();
             _states[key] = state;
         }
-        state.Chain = chain;
-        if (state.Index >= chain.Count) state.Index = 0;
         return state;
     }
 
     private static string Key(ComboFlow flow, FlowNode trigger) => $"{flow.Id}:{trigger.Id}";
-
-    private static List<FlowNode> GetChain(ComboFlow flow, FlowNode trigger) {
-        var chain   = new List<FlowNode>();
-        var current = trigger.Id;
-        var visited = new HashSet<string>();
-
-        while (!visited.Contains(current)) {
-            visited.Add(current);
-            var edge = flow.Edges.Find(e => e.FromNodeId == current);
-            if (edge == null) break;
-            var next = flow.Nodes.Find(n => n.Id == edge.ToNodeId);
-            if (next is not { Type: NodeType.Action }) break;
-            chain.Add(next);
-            current = next.Id;
-        }
-        return chain;
-    }
 }

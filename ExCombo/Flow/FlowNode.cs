@@ -5,6 +5,7 @@ namespace ExCombo.Flow;
 public enum NodeType {
     Trigger = 0,
     Action  = 1,
+    Branch  = 2,
 }
 
 public class FlowNode {
@@ -15,4 +16,5 @@ public class FlowNode {
     public uint     ActionId    { get; set; }
     public string   ActionLabel { get; set; } = "";
     public uint     IconId      { get; set; }
+    public int      OutputCount { get; set; } = 2;
 }
