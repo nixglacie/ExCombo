@@ -19,7 +19,7 @@ internal static class JobGaugeRegistry {
         ],
         ["DRK"] = [
             new("Blood",                   () => Plugin.JobGauges.Get<DRKGauge>().Blood),
-            new("DarksideTimeRemaining",   () => Plugin.JobGauges.Get<DRKGauge>().DarksideTimeRemaining),
+            new("DarksideTimeRemaining",   () => Plugin.JobGauges.Get<DRKGauge>().DarksideTimeRemaining / 1000f),
             new("HasDarkArts",             () => Plugin.JobGauges.Get<DRKGauge>().HasDarkArts ? 1 : 0),
         ],
         ["GNB"] = [
@@ -29,12 +29,12 @@ internal static class JobGaugeRegistry {
         ["WHM"] = [
             new("Lily",                    () => Plugin.JobGauges.Get<WHMGauge>().Lily),
             new("BloodLily",               () => Plugin.JobGauges.Get<WHMGauge>().BloodLily),
-            new("LilyTimer",               () => Plugin.JobGauges.Get<WHMGauge>().LilyTimer),
+            new("LilyTimer",               () => Plugin.JobGauges.Get<WHMGauge>().LilyTimer / 1000f),
         ],
         ["SCH"] = [
             new("Aetherflow",              () => Plugin.JobGauges.Get<SCHGauge>().Aetherflow),
             new("FairyGauge",              () => Plugin.JobGauges.Get<SCHGauge>().FairyGauge),
-            new("SeraphTimer",             () => Plugin.JobGauges.Get<SCHGauge>().SeraphTimer),
+            new("SeraphTimer",             () => Plugin.JobGauges.Get<SCHGauge>().SeraphTimer / 1000f),
         ],
         ["AST"] = [
             new("DrawnCrownCard",          () => (float)Plugin.JobGauges.Get<ASTGauge>().DrawnCrownCard),
@@ -48,11 +48,11 @@ internal static class JobGaugeRegistry {
             new("OpoOpoFury",              () => Plugin.JobGauges.Get<MNKGauge>().OpoOpoFury),
             new("RaptorFury",              () => Plugin.JobGauges.Get<MNKGauge>().RaptorFury),
             new("CoeurlFury",              () => Plugin.JobGauges.Get<MNKGauge>().CoeurlFury),
-            new("BlitzTimeRemaining",      () => Plugin.JobGauges.Get<MNKGauge>().BlitzTimeRemaining),
+            new("BlitzTimeRemaining",      () => Plugin.JobGauges.Get<MNKGauge>().BlitzTimeRemaining / 1000f),
         ],
         ["DRG"] = [
             new("IsLOTDActive",            () => Plugin.JobGauges.Get<DRGGauge>().IsLOTDActive ? 1 : 0),
-            new("LOTDTimer",               () => Plugin.JobGauges.Get<DRGGauge>().LOTDTimer),
+            new("LOTDTimer",               () => Plugin.JobGauges.Get<DRGGauge>().LOTDTimer / 1000f),
             new("FirstmindsFocusCount",    () => Plugin.JobGauges.Get<DRGGauge>().FirstmindsFocusCount),
         ],
         ["NIN"] = [
@@ -78,7 +78,7 @@ internal static class JobGaugeRegistry {
         ["BRD"] = [
             new("SoulVoice",               () => Plugin.JobGauges.Get<BRDGauge>().SoulVoice),
             new("Repertoire",              () => Plugin.JobGauges.Get<BRDGauge>().Repertoire),
-            new("SongTimer",               () => Plugin.JobGauges.Get<BRDGauge>().SongTimer),
+            new("SongTimer",               () => Plugin.JobGauges.Get<BRDGauge>().SongTimer / 1000f),
             new("Song",                    () => (float)Plugin.JobGauges.Get<BRDGauge>().Song),
         ],
         ["MCH"] = [
@@ -99,15 +99,15 @@ internal static class JobGaugeRegistry {
             new("UmbralHearts",            () => Plugin.JobGauges.Get<BLMGauge>().UmbralHearts),
             new("PolyglotStacks",          () => Plugin.JobGauges.Get<BLMGauge>().PolyglotStacks),
             new("AstralSoulStacks",        () => Plugin.JobGauges.Get<BLMGauge>().AstralSoulStacks),
-            new("EnochianTimer",           () => Plugin.JobGauges.Get<BLMGauge>().EnochianTimer),
+            new("EnochianTimer",           () => Plugin.JobGauges.Get<BLMGauge>().EnochianTimer / 1000f),
             new("IsParadoxActive",         () => Plugin.JobGauges.Get<BLMGauge>().IsParadoxActive ? 1 : 0),
             new("InAstralFire",            () => Plugin.JobGauges.Get<BLMGauge>().InAstralFire ? 1 : 0),
             new("InUmbralIce",             () => Plugin.JobGauges.Get<BLMGauge>().InUmbralIce ? 1 : 0),
         ],
         ["SMN"] = [
             new("AttunementCount",         () => Plugin.JobGauges.Get<SMNGauge>().AttunementCount),
-            new("SummonTimerRemaining",    () => Plugin.JobGauges.Get<SMNGauge>().SummonTimerRemaining),
-            new("AttunementTimerRemaining",() => Plugin.JobGauges.Get<SMNGauge>().AttunementTimerRemaining),
+            new("SummonTimerRemaining",    () => Plugin.JobGauges.Get<SMNGauge>().SummonTimerRemaining / 1000f),
+            new("AttunementTimerRemaining",() => Plugin.JobGauges.Get<SMNGauge>().AttunementTimerRemaining / 1000f),
             new("HasAetherflowStacks",     () => Plugin.JobGauges.Get<SMNGauge>().HasAetherflowStacks ? 1 : 0),
         ],
         ["RDM"] = [

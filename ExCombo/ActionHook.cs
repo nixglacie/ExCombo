@@ -50,12 +50,13 @@ internal sealed class ActionHook : IDisposable {
                 foreach (var trigger in flow.Nodes) {
                     if (trigger.Type != NodeType.Trigger) continue;
                     if (trigger.ActionId == 0 || trigger.ActionId != actionId) continue;
-                    var r = FlowExecutor.Resolve(flow, trigger, actionId);
-                    if (!_lastIcon.TryGetValue(actionId, out var prev) || prev != r) {
-                        Plugin.Log.Debug($"[ExCombo][Icon] slot={actionId} → {r}");
-                        _lastIcon[actionId] = r;
+                    var r       = FlowExecutor.Resolve(flow, trigger, actionId);
+                    var evolved = _hook.Original(actionManager, r);
+                    if (!_lastIcon.TryGetValue(actionId, out var prev) || prev != evolved) {
+                        Plugin.Log.Debug($"[ExCombo][Icon] slot={actionId} → {evolved}");
+                        _lastIcon[actionId] = evolved;
                     }
-                    return r;
+                    return evolved;
                 }
             }
         } catch (Exception ex) {
@@ -79,7 +80,7 @@ internal sealed class ActionHook : IDisposable {
                     if (trigger.Type != NodeType.Trigger) continue;
                     if (a5 == 0) {
                         // a5=0: only the exact button pressed should advance its trigger.
-                        if (trigger.ActionId != actionId) continue;
+                        if (trigger.ActionId != actionId && _hook.Original(actionManager, trigger.ActionId) != actionId) continue;
                         var current = FlowExecutor.GetCurrentChainAction(flow, trigger);
                         var isQueued = ActionManager.Instance()->ActionQueued;
                         if (isQueued) {
@@ -88,9 +89,9 @@ internal sealed class ActionHook : IDisposable {
                             FlowExecutor.NotifyPressed(flow, trigger);
                         }
                     } else {
-                        // a5=1: match by trigger id OR current chain action (to find which trigger owns this queued fire).
+                        // a5=1: match by trigger id OR current chain action (including evolved IDs).
                         var current = FlowExecutor.GetCurrentChainAction(flow, trigger);
-                        if (trigger.ActionId != actionId && current != actionId) continue;
+                        if (trigger.ActionId != actionId && current != actionId && _hook.Original(actionManager, current) != actionId) continue;
                         FlowExecutor.NotifyFired(flow, trigger);
                     }
                 }

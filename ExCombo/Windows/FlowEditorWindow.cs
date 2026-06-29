@@ -32,9 +32,10 @@ public class FlowEditorWindow : Window {
     private string? _draggingNodeId;
 
     private string? _condEditNodeId;
-    private string  _condFieldSearch = "";
+    private string  _condFieldSearch   = "";
+    private string  _condFieldSelected = "";
     private int     _condEditOp;
-    private float   _condEditVal;
+    private int     _condEditVal;
 
     private static readonly Dictionary<string, uint> _jobIconCache = new();
 
@@ -43,7 +44,7 @@ public class FlowEditorWindow : Window {
     private Vector2 _marqueeStart;
     private Vector2 _marqueeEnd;
 
-    private List<(string OrigId, NodeType Type, float RelX, float RelY, uint ActionId, string ActionLabel, uint IconId, int OutputCount, string CondField, int CondOp, float CondVal)>? _clipboardNodes;
+    private List<(string OrigId, NodeType Type, float RelX, float RelY, uint ActionId, string ActionLabel, uint IconId, int OutputCount, string CondField, int CondOp, int CondVal)>? _clipboardNodes;
     private List<(string FromOrig, string ToOrig, int PortIdx)>?                                                                                                                               _clipboardEdges;
 
     private static readonly Vector2 NodeSize    = new(64f, 64f);
@@ -447,7 +448,7 @@ public class FlowEditorWindow : Window {
                     isSelected || nodeHovered ? 2f : 1.5f);
 
                 var condLabel      = node.ConditionField != ""
-                    ? $"{node.ConditionField} {((CompareOp)node.ConditionCompareOp).ToLabel()} {node.ConditionCompareVal:G4}"
+                    ? $"{node.ConditionField} {((CompareOp)node.ConditionCompareOp).ToLabel()} {node.ConditionCompareVal}"
                     : "Job Condition";
                 var condLabelWidth = ImGui.CalcTextSize(condLabel).X;
                 var condLabelPos   = sp + new Vector2((NodeSize.X - condLabelWidth) * 0.5f, -16f);
@@ -550,6 +551,11 @@ public class FlowEditorWindow : Window {
                 } else {
                     if (IconMenuItem(FontAwesomeIcon.Edit,   "Edit Action"))  OpenPicker(node.Id);
                 }
+                ImGui.Separator();
+                if (IconMenuItem(FontAwesomeIcon.Copy, "Copy")) {
+                    _clipboardNodes = [(node.Id, node.Type, 0f, 0f, node.ActionId, node.ActionLabel, node.IconId, node.OutputCount, node.ConditionField, node.ConditionCompareOp, (int)node.ConditionCompareVal)];
+                    _clipboardEdges = [];
+                }
                 if (IconMenuItem(FontAwesomeIcon.TrashAlt, "Delete Node"))  _pendingDeleteNodeId = node.Id;
                 if (IconMenuItem(FontAwesomeIcon.Unlink,   "Remove Links")) {
                     _flow.Edges.RemoveAll(e => e.FromNodeId == node.Id || e.ToNodeId == node.Id);
@@ -586,7 +592,7 @@ public class FlowEditorWindow : Window {
                 _clipboardEdges = new();
                 foreach (var n in _flow.Nodes) {
                     if (!_selectedNodeIds.Contains(n.Id)) continue;
-                    _clipboardNodes.Add((n.Id, n.Type, n.X - cx, n.Y - cy, n.ActionId, n.ActionLabel, n.IconId, n.OutputCount, n.ConditionField, n.ConditionCompareOp, n.ConditionCompareVal));
+                    _clipboardNodes.Add((n.Id, n.Type, n.X - cx, n.Y - cy, n.ActionId, n.ActionLabel, n.IconId, n.OutputCount, n.ConditionField, n.ConditionCompareOp, (int)n.ConditionCompareVal));
                 }
                 foreach (var e in _flow.Edges) {
                     if (_selectedNodeIds.Contains(e.FromNodeId) && _selectedNodeIds.Contains(e.ToNodeId))
@@ -937,10 +943,11 @@ public class FlowEditorWindow : Window {
 
     private void OpenConditionEdit(string nodeId) {
         var node         = _flow!.Nodes.Find(n => n.Id == nodeId);
-        _condEditNodeId  = nodeId;
-        _condFieldSearch = node?.ConditionField ?? "";
+        _condEditNodeId    = nodeId;
+        _condFieldSearch   = "";
+        _condFieldSelected = node?.ConditionField ?? "";
         _condEditOp      = node?.ConditionCompareOp ?? 5;
-        _condEditVal     = node?.ConditionCompareVal ?? 1f;
+        _condEditVal     = (int)(node?.ConditionCompareVal ?? 1f);
         ImGui.OpenPopup("Edit Condition##condedit");
     }
 
@@ -963,9 +970,9 @@ public class FlowEditorWindow : Window {
             foreach (var f in fields) {
                 if (_condFieldSearch.Length > 0
                     && !f.Name.Contains(_condFieldSearch, StringComparison.OrdinalIgnoreCase)) continue;
-                bool sel = f.Name == _condFieldSearch;
+                bool sel = f.Name == _condFieldSelected;
                 if (ImGui.Selectable(f.Name, sel))
-                    _condFieldSearch = f.Name;
+                    _condFieldSelected = f.Name;
             }
         } else {
             ImGui.TextDisabled("No gauge fields for this job.");
@@ -980,7 +987,7 @@ public class FlowEditorWindow : Window {
         ImGui.Combo("##cfop", ref _condEditOp, opLabels, opLabels.Length);
         ImGui.SameLine();
         ImGui.SetNextItemWidth(-1f);
-        ImGui.DragFloat("##cfval", ref _condEditVal, 1f);
+        ImGui.DragInt("##cfval", ref _condEditVal, 1f);
 
         ImGui.Spacing();
 
@@ -994,7 +1001,7 @@ public class FlowEditorWindow : Window {
         if (ImGui.Button("OK", new Vector2(btnW, 0f))) {
             var node = _flow!.Nodes.Find(n => n.Id == _condEditNodeId);
             if (node != null) {
-                node.ConditionField      = _condFieldSearch;
+                node.ConditionField      = _condFieldSelected;
                 node.ConditionCompareOp  = _condEditOp;
                 node.ConditionCompareVal = _condEditVal;
                 FlowExecutor.InvalidateFlow(_flow.Id);
