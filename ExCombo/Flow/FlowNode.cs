@@ -3,9 +3,10 @@ using System;
 namespace ExCombo.Flow;
 
 public enum NodeType {
-    Trigger = 0,
-    Action  = 1,
-    Branch  = 2,
+    Trigger   = 0,
+    Action    = 1,
+    Branch    = 2,
+    Condition = 3,
 }
 
 public class FlowNode {
@@ -17,4 +18,9 @@ public class FlowNode {
     public string   ActionLabel { get; set; } = "";
     public uint     IconId      { get; set; }
     public int      OutputCount { get; set; } = 2;
+
+    // Condition node fields
+    public string ConditionField      { get; set; } = "";
+    public int    ConditionCompareOp  { get; set; } = 5;  // CompareOp.Gte
+    public float  ConditionCompareVal { get; set; } = 1f;
 }

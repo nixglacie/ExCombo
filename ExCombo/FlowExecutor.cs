@@ -1,24 +1,33 @@
 using System;
 using System.Collections.Generic;
 using ExCombo.Flow;
+using ExCombo.Helpers;
 using FFXIVClientStructs.FFXIV.Client.Game;
 
 namespace ExCombo;
 
 internal static class FlowExecutor {
     private sealed class FlowRunState {
-        public string  NextActionId      = "";
-        public string? CurrentBranchId   = null;
-        public int     CurrentBranchPort = 0;
+        public string  NextActionId        = "";
+        public string? CurrentBranchId     = null;
+        public string? ActiveBranchNodeId  = null;
+        public int     CurrentBranchPort   = 0;
         public readonly Dictionary<string, BranchNodeState> BranchStates = new();
-        public bool    PendingFire       = false;
-        public uint    FrozenReturn      = 0;
-        public long    LastPressedTick   = 0;
+        public bool    PendingFire         = false;
+        public uint    FrozenReturn        = 0;
+        public long    LastPressedTick     = 0;
     }
 
     private sealed class BranchNodeState {
         public int ActivePort = -1;
-        public int PortIndex  = 0;
+        public readonly Dictionary<int, int> PortProgress = new();
+
+        public int  GetProgress(int port) =>
+            PortProgress.TryGetValue(port, out var i) ? i : 0;
+        public void SetProgress(int port, int index) {
+            if (index <= 0) PortProgress.Remove(port);
+            else PortProgress[port] = index;
+        }
     }
 
     private static readonly Dictionary<string, FlowRunState> _states = new();
@@ -44,6 +53,11 @@ internal static class FlowExecutor {
 
         if (state.NextActionId == "")
             FindInitialAction(flow, trigger, state);
+        else if (state.ActiveBranchNodeId != null && !state.PendingFire && !InQueueExecute) {
+            // Re-evaluate branch every frame so icon updates the moment a condition becomes true.
+            var branchNode = flow.Nodes.Find(n => n.Id == state.ActiveBranchNodeId);
+            if (branchNode != null) EnterBranch(flow, state, branchNode);
+        }
 
         if (InQueueExecute && !state.PendingFire) return triggerActionId;
         if (state.PendingFire) return state.FrozenReturn;
@@ -96,20 +110,23 @@ internal static class FlowExecutor {
     private static void AdvanceState(ComboFlow flow, FlowNode trigger, FlowRunState state) {
         if (state.CurrentBranchId != null) {
             if (!state.BranchStates.TryGetValue(state.CurrentBranchId, out var bs)) {
-                state.CurrentBranchId = null;
+                state.CurrentBranchId    = null;
+                state.ActiveBranchNodeId = null;
                 FindInitialAction(flow, trigger, state);
                 return;
             }
-            bs.PortIndex++;
             var portChain = GetPortChain(flow, state.CurrentBranchId, bs.ActivePort);
-            if (bs.PortIndex < portChain.Count) {
-                state.NextActionId = portChain[bs.PortIndex].Id;
-            } else {
-                bs.ActivePort         = -1;
-                bs.PortIndex          = 0;
-                state.CurrentBranchId = null;
-                FindInitialAction(flow, trigger, state);
+            var newIdx    = bs.GetProgress(bs.ActivePort) + 1;
+            bs.SetProgress(bs.ActivePort, newIdx < portChain.Count ? newIdx : 0);
+            if (newIdx >= portChain.Count) bs.ActivePort = -1;
+
+            state.CurrentBranchId = null;
+            if (state.ActiveBranchNodeId != null) {
+                var branchNode = flow.Nodes.Find(n => n.Id == state.ActiveBranchNodeId);
+                if (branchNode != null) { EnterBranch(flow, state, branchNode); return; }
+                state.ActiveBranchNodeId = null;
             }
+            FindInitialAction(flow, trigger, state);
         } else {
             var edge = flow.Edges.Find(e => e.FromNodeId == state.NextActionId && e.FromPortIndex == 0);
             if (edge == null) { FindInitialAction(flow, trigger, state); return; }
@@ -117,6 +134,7 @@ internal static class FlowExecutor {
             if      (next == null || next.Type == NodeType.Trigger) FindInitialAction(flow, trigger, state);
             else if (next.Type == NodeType.Action)                  state.NextActionId = next.Id;
             else if (next.Type == NodeType.Branch)                  EnterBranch(flow, state, next);
+            else if (next.Type == NodeType.Condition)               EnterCondition(flow, state, next);
         }
     }
 
@@ -124,13 +142,16 @@ internal static class FlowExecutor {
         var edge = flow.Edges.Find(e => e.FromNodeId == trigger.Id && e.FromPortIndex == 0);
         if (edge == null) { state.NextActionId = ""; return; }
         var next = flow.Nodes.Find(n => n.Id == edge.ToNodeId);
-        if      (next == null)                  state.NextActionId = "";
-        else if (next.Type == NodeType.Action)  state.NextActionId = next.Id;
-        else if (next.Type == NodeType.Branch)  EnterBranch(flow, state, next);
-        else                                    state.NextActionId = "";
+        if      (next == null)                    state.NextActionId = "";
+        else if (next.Type == NodeType.Action)    state.NextActionId = next.Id;
+        else if (next.Type == NodeType.Branch)    EnterBranch(flow, state, next);
+        else if (next.Type == NodeType.Condition) EnterCondition(flow, state, next);
+        else                                      state.NextActionId = "";
     }
 
     private static void EnterBranch(ComboFlow flow, FlowRunState state, FlowNode branchNode) {
+        state.ActiveBranchNodeId = branchNode.Id;
+
         if (!state.BranchStates.TryGetValue(branchNode.Id, out var bs)) {
             bs = new BranchNodeState();
             state.BranchStates[branchNode.Id] = bs;
@@ -140,30 +161,74 @@ internal static class FlowExecutor {
         List<FlowNode>? fallbackChain = null;
 
         for (var port = 0; port < branchNode.OutputCount; port++) {
+            var portEdge  = flow.Edges.Find(e => e.FromNodeId == branchNode.Id && e.FromPortIndex == port);
+            var firstNode = portEdge != null ? flow.Nodes.Find(n => n.Id == portEdge.ToNodeId) : null;
+
+            if (firstNode?.Type == NodeType.Condition) {
+                if (!EvaluateCondition(flow.Job, firstNode)) continue;
+                var condChain = GetPortChain(flow, firstNode.Id, 0);
+                if (condChain.Count == 0) continue;
+                // Condition true → take this branch immediately, no usability check.
+                // Icon update + game queue handles timing; player sees intent, game fires on GCD expiry.
+                EnterCondition(flow, state, firstNode);
+                return;
+            }
+
             var chain = GetPortChain(flow, branchNode.Id, port);
             if (chain.Count == 0) continue;
+            var progress = bs.GetProgress(port);
+            if (progress >= chain.Count) { bs.SetProgress(port, 0); progress = 0; }
             if (fallbackPort < 0) { fallbackPort = port; fallbackChain = chain; }
-            if (IsActionUsable(chain[0].ActionId)) {
+            if (IsActionUsable(chain[progress].ActionId)) {
                 bs.ActivePort           = port;
-                bs.PortIndex            = 0;
                 state.CurrentBranchId   = branchNode.Id;
                 state.CurrentBranchPort = port;
-                state.NextActionId      = chain[0].Id;
+                state.NextActionId      = chain[progress].Id;
                 return;
             }
         }
 
-        // No port passed usability check (e.g. GCD just fired) — fall back to first connected port.
-        // Priority selection still activates when cooldowns differ between ports.
+        // All direct ports on GCD — fall back to first connected direct port.
         if (fallbackPort >= 0) {
+            var progress = bs.GetProgress(fallbackPort);
+            if (progress >= fallbackChain!.Count) { bs.SetProgress(fallbackPort, 0); progress = 0; }
             bs.ActivePort           = fallbackPort;
-            bs.PortIndex            = 0;
             state.CurrentBranchId   = branchNode.Id;
             state.CurrentBranchPort = fallbackPort;
-            state.NextActionId      = fallbackChain![0].Id;
+            state.NextActionId      = fallbackChain![progress].Id;
         } else {
             state.NextActionId = "";
         }
+    }
+
+    private static void EnterCondition(ComboFlow flow, FlowRunState state, FlowNode condNode) {
+        bool result = EvaluateCondition(flow.Job, condNode);
+        int  port   = result ? 0 : 1;
+        var  chain  = GetPortChain(flow, condNode.Id, port);
+        if (chain.Count == 0) { port ^= 1; chain = GetPortChain(flow, condNode.Id, port); }
+        if (chain.Count == 0) { state.NextActionId = ""; return; }
+
+        if (!state.BranchStates.TryGetValue(condNode.Id, out var bs)) {
+            bs = new BranchNodeState();
+            state.BranchStates[condNode.Id] = bs;
+        }
+        if (bs.ActivePort >= 0 && bs.ActivePort != port) bs.SetProgress(bs.ActivePort, 0);
+        var progress = bs.GetProgress(port);
+        if (progress >= chain.Count) { bs.SetProgress(port, 0); progress = 0; }
+        bs.ActivePort           = port;
+        state.CurrentBranchId   = condNode.Id;
+        state.CurrentBranchPort = port;
+        state.NextActionId      = chain[progress].Id;
+    }
+
+    private static bool EvaluateCondition(string job, FlowNode condNode) {
+        var fields = JobGaugeRegistry.GetFields(job);
+        if (fields == null) return false;
+        foreach (var f in fields) {
+            if (f.Name != condNode.ConditionField) continue;
+            return ((CompareOp)condNode.ConditionCompareOp).Evaluate(f.Get(), condNode.ConditionCompareVal);
+        }
+        return false;
     }
 
     private static List<FlowNode> GetPortChain(ComboFlow flow, string branchNodeId, int portIndex) {
@@ -191,14 +256,15 @@ internal static class FlowExecutor {
     }
 
     private static void ResetState(FlowRunState s) {
-        s.NextActionId    = "";
-        s.CurrentBranchId = null;
-        s.PendingFire     = false;
-        s.FrozenReturn    = 0;
-        s.LastPressedTick = 0;
+        s.NextActionId       = "";
+        s.CurrentBranchId    = null;
+        s.ActiveBranchNodeId = null;
+        s.PendingFire        = false;
+        s.FrozenReturn       = 0;
+        s.LastPressedTick    = 0;
         foreach (var bs in s.BranchStates.Values) {
             bs.ActivePort = -1;
-            bs.PortIndex  = 0;
+            bs.PortProgress.Clear();
         }
     }
 

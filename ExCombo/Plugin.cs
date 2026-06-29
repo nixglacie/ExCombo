@@ -17,6 +17,7 @@ public sealed class Plugin : IDalamudPlugin {
     [PluginService] internal static IDtrBar                 DtrBar             { get; private set; } = null!;
     [PluginService] internal static IGameInteropProvider    GameInteropProvider { get; private set; } = null!;
     [PluginService] internal static IDataManager            DataManager         { get; private set; } = null!;
+    [PluginService] internal static IJobGauges              JobGauges           { get; private set; } = null!;
 
     private readonly Configuration    _config;
     private readonly WindowSystem     _windowSystem = new("ExCombo");
