@@ -37,6 +37,11 @@ public class FlowEditorWindow : Window {
     private int     _condEditOp;
     private int     _condEditVal;
 
+    // Deferred popup opens — set inside popup contexts, opened outside
+    private bool _pendingOpenPicker;
+    private bool _pendingOpenBranchEdit;
+    private bool _pendingOpenCondEdit;
+
     private static readonly Dictionary<string, uint> _jobIconCache = new();
 
     private readonly HashSet<string> _selectedNodeIds = new();
@@ -44,8 +49,8 @@ public class FlowEditorWindow : Window {
     private Vector2 _marqueeStart;
     private Vector2 _marqueeEnd;
 
-    private List<(string OrigId, NodeType Type, float RelX, float RelY, uint ActionId, string ActionLabel, uint IconId, int OutputCount, string CondField, int CondOp, int CondVal)>? _clipboardNodes;
-    private List<(string FromOrig, string ToOrig, int PortIdx)>?                                                                                                                               _clipboardEdges;
+    private List<(string OrigId, NodeType Type, float RelX, float RelY, uint ActionId, string ActionLabel, uint IconId, int OutputCount, string CondField, int CondOp, int CondVal, bool IsOgcd)>? _clipboardNodes;
+    private List<(string FromOrig, string ToOrig, int PortIdx)>?                                                                                                                                                                                                   _clipboardEdges;
 
     private static readonly Vector2 NodeSize    = new(64f, 64f);
     private const           float   PortRadius  = 6f;
@@ -517,6 +522,7 @@ public class FlowEditorWindow : Window {
                 var labelPos   = sp + new Vector2((NodeSize.X - labelWidth) * 0.5f, -16f);
                 DrawHelpers.DrawText(dl, labelPos, label, Col(accentR, accentG, accentB), true);
 
+
                 // Delete button (top-right, visible on hover)
                 if (nodeHovered) {
                     var xBtn = sp + new Vector2(NodeSize.X - 7f, 7f);
@@ -553,7 +559,7 @@ public class FlowEditorWindow : Window {
                 }
                 ImGui.Separator();
                 if (IconMenuItem(FontAwesomeIcon.Copy, "Copy")) {
-                    _clipboardNodes = [(node.Id, node.Type, 0f, 0f, node.ActionId, node.ActionLabel, node.IconId, node.OutputCount, node.ConditionField, node.ConditionCompareOp, (int)node.ConditionCompareVal)];
+                    _clipboardNodes = [(node.Id, node.Type, 0f, 0f, node.ActionId, node.ActionLabel, node.IconId, node.OutputCount, node.ConditionField, node.ConditionCompareOp, (int)node.ConditionCompareVal, node.IsOgcd)];
                     _clipboardEdges = [];
                 }
                 if (IconMenuItem(FontAwesomeIcon.TrashAlt, "Delete Node"))  _pendingDeleteNodeId = node.Id;
@@ -592,7 +598,7 @@ public class FlowEditorWindow : Window {
                 _clipboardEdges = new();
                 foreach (var n in _flow.Nodes) {
                     if (!_selectedNodeIds.Contains(n.Id)) continue;
-                    _clipboardNodes.Add((n.Id, n.Type, n.X - cx, n.Y - cy, n.ActionId, n.ActionLabel, n.IconId, n.OutputCount, n.ConditionField, n.ConditionCompareOp, (int)n.ConditionCompareVal));
+                    _clipboardNodes.Add((n.Id, n.Type, n.X - cx, n.Y - cy, n.ActionId, n.ActionLabel, n.IconId, n.OutputCount, n.ConditionField, n.ConditionCompareOp, (int)n.ConditionCompareVal, n.IsOgcd));
                 }
                 foreach (var e in _flow.Edges) {
                     if (_selectedNodeIds.Contains(e.FromNodeId) && _selectedNodeIds.Contains(e.ToNodeId))
@@ -670,7 +676,7 @@ public class FlowEditorWindow : Window {
                     var pastePos = _contextMenuCanvasPos;
                     var idMap    = new Dictionary<string, string>();
                     var newNodes = new List<FlowNode>();
-                    foreach (var (origId, type, relX, relY, actionId, label, iconId, outputCount, condField, condOp, condVal) in _clipboardNodes) {
+                    foreach (var (origId, type, relX, relY, actionId, label, iconId, outputCount, condField, condOp, condVal, isOgcd) in _clipboardNodes) {
                         var nn = new FlowNode {
                             Type               = type,
                             X                  = MathF.Round((pastePos.X + relX) / GridStep) * GridStep,
@@ -682,6 +688,7 @@ public class FlowEditorWindow : Window {
                             ConditionField     = condField,
                             ConditionCompareOp = condOp,
                             ConditionCompareVal= condVal,
+                            IsOgcd             = isOgcd,
                         };
                         idMap[origId] = nn.Id;
                         newNodes.Add(nn);
@@ -707,7 +714,12 @@ public class FlowEditorWindow : Window {
             dl.AddText(canvasMin + new Vector2(12f, 12f), Col(0.333f, 0.353f, 0.388f),
                 "Right-click to add nodes  •  Middle-drag to pan  •  Drag output port (right circle) to wire");
 
-        // ── Action picker modal ───────────────────────────────────────────
+        // ── Deferred popup opens (must be outside all BeginPopup contexts) ──
+        if (_pendingOpenPicker)     { ImGui.OpenPopup("Pick Action##picker");        _pendingOpenPicker     = false; }
+        if (_pendingOpenBranchEdit) { ImGui.OpenPopup("Branch Outputs##branchedit"); _pendingOpenBranchEdit = false; }
+        if (_pendingOpenCondEdit)   { ImGui.OpenPopup("Edit Condition##condedit");   _pendingOpenCondEdit   = false; }
+
+        // ── Modals ────────────────────────────────────────────────────────
         DrawActionPicker();
         DrawBranchEdit();
         DrawConditionEdit();
@@ -738,9 +750,9 @@ public class FlowEditorWindow : Window {
     }
 
     private void OpenBranchEdit(string nodeId, int currentCount) {
-        _branchEditNodeId = nodeId;
-        _branchEditCount  = currentCount;
-        ImGui.OpenPopup("Branch Outputs##branchedit");
+        _branchEditNodeId    = nodeId;
+        _branchEditCount     = currentCount;
+        _pendingOpenBranchEdit = true;
     }
 
     private void DrawBranchEdit() {
@@ -799,7 +811,7 @@ public class FlowEditorWindow : Window {
         _pickerLastSearch = "\0";
         _pickerResults.Clear();
         BuildJobCategorySet();
-        ImGui.OpenPopup("Pick Action##picker");
+        _pendingOpenPicker = true;
     }
 
     private void DrawActionPicker() {
@@ -847,6 +859,8 @@ public class FlowEditorWindow : Window {
                         node.ActionId    = id;
                         node.ActionLabel = name;
                         node.IconId      = icon;
+                        var aRow = Plugin.DataManager.GetExcelSheet<LuminaAction>()?.GetRow(id);
+                        node.IsOgcd      = aRow.HasValue && aRow.Value.CooldownGroup != 57;
                         FlowExecutor.InvalidateFlow(_flow.Id);
                         _config.Save();
                     }
@@ -942,13 +956,13 @@ public class FlowEditorWindow : Window {
     }
 
     private void OpenConditionEdit(string nodeId) {
-        var node         = _flow!.Nodes.Find(n => n.Id == nodeId);
+        var node           = _flow!.Nodes.Find(n => n.Id == nodeId);
         _condEditNodeId    = nodeId;
         _condFieldSearch   = "";
         _condFieldSelected = node?.ConditionField ?? "";
-        _condEditOp      = node?.ConditionCompareOp ?? 5;
-        _condEditVal     = (int)(node?.ConditionCompareVal ?? 1f);
-        ImGui.OpenPopup("Edit Condition##condedit");
+        _condEditOp        = node?.ConditionCompareOp ?? 5;
+        _condEditVal       = (int)(node?.ConditionCompareVal ?? 1f);
+        _pendingOpenCondEdit = true;
     }
 
     private void DrawConditionEdit() {

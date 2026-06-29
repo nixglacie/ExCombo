@@ -71,7 +71,23 @@ internal sealed class ActionHook : IDisposable {
         FlowExecutor.InQueueExecute = false;
         Plugin.Log.Debug($"[ExCombo][UseAction] id={actionId} a5={a5} result={result}");
 
-        if (!result) return false;
+        if (!result) {
+            if (a5 == 1) {
+                // Queue fired but failed (e.g. out of range) — unfreeze so player can retry
+                try {
+                    foreach (var flow in _config.Flows) {
+                        if (!flow.Enabled) continue;
+                        foreach (var trigger in flow.Nodes) {
+                            if (trigger.Type != NodeType.Trigger) continue;
+                            FlowExecutor.NotifyQueueFailed(flow, trigger);
+                        }
+                    }
+                } catch (Exception ex) {
+                    Plugin.Log.Error(ex, "ActionHook queue fail error");
+                }
+            }
+            return false;
+        }
 
         try {
             foreach (var flow in _config.Flows) {

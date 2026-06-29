@@ -16,6 +16,9 @@ internal static class FlowExecutor {
         public bool    PendingFire         = false;
         public uint    FrozenReturn        = 0;
         public long    LastPressedTick     = 0;
+        public int     WeavedThisWindow    = 0;
+        public float   LastGCDElapsed      = 0f;
+        public string? LastTickSkipId      = null;
     }
 
     private sealed class BranchNodeState {
@@ -40,12 +43,43 @@ internal static class FlowExecutor {
     public static void Tick(List<ComboFlow> flows) {
         var now = Environment.TickCount64;
         foreach (var flow in flows)
-            foreach (var trigger in flow.Nodes)
-                if (trigger.Type == NodeType.Trigger && _states.TryGetValue(Key(flow, trigger), out var s)
-                    && s.LastPressedTick > 0 && (now - s.LastPressedTick) > ResetAfterMs) {
+            foreach (var trigger in flow.Nodes) {
+                if (trigger.Type != NodeType.Trigger) continue;
+                if (!_states.TryGetValue(Key(flow, trigger), out var s)) continue;
+
+                if (s.LastPressedTick > 0 && (now - s.LastPressedTick) > ResetAfterMs) {
                     Plugin.Log.Debug($"[ExCombo][Tick] trigger={trigger.ActionId} inactive {ResetAfterMs}ms, resetting");
                     ResetState(s);
+                    continue;
                 }
+
+                // Detect new GCD window (elapsed went backwards) → reset weave count
+                var gcdElapsed = WeaveHelper.GCDElapsed;
+                if (s.WeavedThisWindow > 0 && gcdElapsed < s.LastGCDElapsed - 0.05f) {
+                    Plugin.Log.Debug($"[ExCombo][Tick] trigger={trigger.ActionId} new GCD window, resetting WeavedThisWindow={s.WeavedThisWindow}→0");
+                    s.WeavedThisWindow = 0;
+                    s.LastTickSkipId   = null;
+                }
+                s.LastGCDElapsed = gcdElapsed;
+
+                // Auto-skip oGCD nodes when window expired or max weaves (2) reached
+                if (!s.PendingFire && s.NextActionId != "") {
+                    for (var guard = 0; guard < 20; guard++) {
+                        var cur = flow.Nodes.Find(n => n.Id == s.NextActionId);
+                        if (cur?.IsOgcd != true) break;
+                        bool shouldSkip = WeaveHelper.IsWeaveWindowExpired()
+                                       || (WeaveHelper.IsGcdRolling && s.WeavedThisWindow >= 2);
+                        if (!shouldSkip) break;
+                        if (s.LastTickSkipId != cur.Id) {
+                            Plugin.Log.Debug($"[ExCombo][Tick] trigger={trigger.ActionId} skipping oGCD={cur.ActionId} weaved={s.WeavedThisWindow}");
+                            s.LastTickSkipId = cur.Id;
+                        }
+                        var prevId = s.NextActionId;
+                        AdvanceState(flow, trigger, s);
+                        if (s.NextActionId == "" || s.NextActionId == prevId) break;
+                    }
+                }
+            }
     }
 
     public static uint Resolve(ComboFlow flow, FlowNode trigger, uint triggerActionId) {
@@ -63,6 +97,8 @@ internal static class FlowExecutor {
         if (state.PendingFire) return state.FrozenReturn;
 
         var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
+        if (node != null && node.IsOgcd && (!WeaveHelper.IsGcdRolling || state.WeavedThisWindow >= 2 || WeaveHelper.IsWeaveWindowExpired()))
+            return triggerActionId;
         return node?.ActionId ?? triggerActionId;
     }
 
@@ -73,14 +109,33 @@ internal static class FlowExecutor {
 
     public static void NotifyPressed(ComboFlow flow, FlowNode trigger) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
+        if (state.PendingFire) return; // queue still pending — ignore stray press
         state.LastPressedTick = Environment.TickCount64;
         var before = state.NextActionId;
+        TrackWeaveCount(flow, state);
         AdvanceState(flow, trigger, state);
         Plugin.Log.Debug($"[ExCombo][Advance] trigger={trigger.ActionId} {before}→{state.NextActionId} immediate");
     }
 
+    public static void NotifyQueueFailed(ComboFlow flow, FlowNode trigger) {
+        if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
+        if (!state.PendingFire) return;
+        state.PendingFire  = false;
+        state.FrozenReturn = 0;
+        // Don't advance — action didn't fire; player should retry
+        Plugin.Log.Debug($"[ExCombo][QueueFail] trigger={trigger.ActionId} unfrozen, retry same action");
+    }
+
     public static void NotifyQueued(ComboFlow flow, FlowNode trigger, uint frozenReturn) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
+        var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
+        if (node?.IsOgcd == true && (state.WeavedThisWindow >= 2 || WeaveHelper.IsWeaveWindowExpired())) {
+            // Weave limit hit or window expired — skip oGCD and let queue fire the trigger as-is
+            state.LastPressedTick = Environment.TickCount64;
+            AdvanceState(flow, trigger, state);
+            Plugin.Log.Debug($"[ExCombo][Queue] trigger={trigger.ActionId} oGCD blocked weaved={state.WeavedThisWindow} expired={WeaveHelper.IsWeaveWindowExpired()}, advanced to {state.NextActionId}");
+            return;
+        }
         state.PendingFire     = true;
         state.FrozenReturn    = frozenReturn;
         state.LastPressedTick = Environment.TickCount64;
@@ -94,6 +149,7 @@ internal static class FlowExecutor {
         state.PendingFire     = false;
         state.FrozenReturn    = 0;
         state.LastPressedTick = Environment.TickCount64;
+        TrackWeaveCount(flow, state);
         AdvanceState(flow, trigger, state);
         Plugin.Log.Debug($"[ExCombo][Fired] trigger={trigger.ActionId} {before}→{state.NextActionId}");
     }
@@ -255,6 +311,13 @@ internal static class FlowExecutor {
         return mgr != null && mgr->GetActionStatus(ActionType.Action, actionId) == 0;
     }
 
+    private static void TrackWeaveCount(ComboFlow flow, FlowRunState state) {
+        var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
+        if (node?.IsOgcd == true) state.WeavedThisWindow++;
+        else                      state.WeavedThisWindow = 0;
+        state.LastTickSkipId = null;
+    }
+
     private static void ResetState(FlowRunState s) {
         s.NextActionId       = "";
         s.CurrentBranchId    = null;
@@ -262,6 +325,9 @@ internal static class FlowExecutor {
         s.PendingFire        = false;
         s.FrozenReturn       = 0;
         s.LastPressedTick    = 0;
+        s.WeavedThisWindow   = 0;
+        s.LastGCDElapsed     = 0f;
+        s.LastTickSkipId     = null;
         foreach (var bs in s.BranchStates.Values) {
             bs.ActivePort = -1;
             bs.PortProgress.Clear();

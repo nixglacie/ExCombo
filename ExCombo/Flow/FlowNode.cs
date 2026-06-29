@@ -23,4 +23,7 @@ public class FlowNode {
     public string ConditionField      { get; set; } = "";
     public int    ConditionCompareOp  { get; set; } = 5;  // CompareOp.Gte
     public float  ConditionCompareVal { get; set; } = 1f;
+
+    // True when CooldownGroup != 57 (not on the GCD recast track)
+    public bool IsOgcd { get; set; } = false;
 }
