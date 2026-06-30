@@ -88,16 +88,16 @@ internal static class FlowExecutor {
         if (state.NextActionId == "")
             FindInitialAction(flow, trigger, state);
         else if (state.ActiveBranchNodeId != null && !state.PendingFire && !InQueueExecute) {
-            // Re-evaluate branch every frame so icon updates the moment a condition becomes true.
-            var branchNode = flow.Nodes.Find(n => n.Id == state.ActiveBranchNodeId);
-            if (branchNode != null) EnterBranch(flow, state, branchNode);
+            // Re-evaluate every frame so the icon reflects the highest-priority eligible port.
+            var active = flow.Nodes.Find(n => n.Id == state.ActiveBranchNodeId);
+            if (active != null) ReResolve(flow, state, active);
         }
 
         if (InQueueExecute && !state.PendingFire) return triggerActionId;
         if (state.PendingFire) return state.FrozenReturn;
 
         var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
-        if (node != null && node.IsOgcd && (!WeaveHelper.IsGcdRolling || state.WeavedThisWindow >= 2 || WeaveHelper.IsWeaveWindowExpired()))
+        if (node != null && node.IsOgcd && !WeaveWindowOpen(state))
             return triggerActionId;
         return node?.ActionId ?? triggerActionId;
     }
@@ -165,31 +165,27 @@ internal static class FlowExecutor {
 
     private static void AdvanceState(ComboFlow flow, FlowNode trigger, FlowRunState state) {
         if (state.CurrentBranchId != null) {
-            if (!state.BranchStates.TryGetValue(state.CurrentBranchId, out var bs)) {
+            var routeNode = flow.Nodes.Find(n => n.Id == state.CurrentBranchId);
+            if (routeNode == null || !state.BranchStates.TryGetValue(state.CurrentBranchId, out var bs)) {
                 state.CurrentBranchId    = null;
                 state.ActiveBranchNodeId = null;
                 FindInitialAction(flow, trigger, state);
                 return;
             }
-            var portChain = GetPortChain(flow, state.CurrentBranchId, bs.ActivePort);
-            var newIdx    = bs.GetProgress(bs.ActivePort) + 1;
-            bs.SetProgress(bs.ActivePort, newIdx < portChain.Count ? newIdx : 0);
-            if (newIdx >= portChain.Count) bs.ActivePort = -1;
-
-            state.CurrentBranchId = null;
-            if (state.ActiveBranchNodeId != null) {
-                var branchNode = flow.Nodes.Find(n => n.Id == state.ActiveBranchNodeId);
-                if (branchNode != null) { EnterBranch(flow, state, branchNode); return; }
-                state.ActiveBranchNodeId = null;
-            }
-            FindInitialAction(flow, trigger, state);
+            // Advance the active port's progress, then re-resolve from the top (priority order).
+            // Lower ports keep their progress, so a preempted chain resumes where it left off.
+            var port   = state.CurrentBranchPort;
+            var chain  = GetActiveChain(flow, routeNode, port);
+            var newIdx = bs.GetProgress(port) + 1;
+            bs.SetProgress(port, newIdx < chain.Count ? newIdx : 0);
+            ReResolve(flow, state, routeNode);
         } else {
             var edge = flow.Edges.Find(e => e.FromNodeId == state.NextActionId && e.FromPortIndex == 0);
             if (edge == null) { FindInitialAction(flow, trigger, state); return; }
             var next = flow.Nodes.Find(n => n.Id == edge.ToNodeId);
             if      (next == null || next.Type == NodeType.Trigger) FindInitialAction(flow, trigger, state);
             else if (next.Type == NodeType.Action)                  state.NextActionId = next.Id;
-            else if (next.Type == NodeType.Branch)                  EnterBranch(flow, state, next);
+            else if (next.Type == NodeType.Branch)                  ResolveBranch(flow, state, next);
             else if (next.Type == NodeType.Condition)               EnterCondition(flow, state, next);
         }
     }
@@ -200,12 +196,30 @@ internal static class FlowExecutor {
         var next = flow.Nodes.Find(n => n.Id == edge.ToNodeId);
         if      (next == null)                    state.NextActionId = "";
         else if (next.Type == NodeType.Action)    state.NextActionId = next.Id;
-        else if (next.Type == NodeType.Branch)    EnterBranch(flow, state, next);
+        else if (next.Type == NodeType.Branch)    ResolveBranch(flow, state, next);
         else if (next.Type == NodeType.Condition) EnterCondition(flow, state, next);
         else                                      state.NextActionId = "";
     }
 
-    private static void EnterBranch(ComboFlow flow, FlowRunState state, FlowNode branchNode) {
+    // Re-evaluate a Branch or standalone Condition node from scratch.
+    private static void ReResolve(ComboFlow flow, FlowRunState state, FlowNode node) {
+        if      (node.Type == NodeType.Branch)    ResolveBranch(flow, state, node);
+        else if (node.Type == NodeType.Condition) EnterCondition(flow, state, node);
+    }
+
+    // The action chain currently routed through a branch port (resolves nested Condition gates).
+    private static List<FlowNode> GetActiveChain(ComboFlow flow, FlowNode routeNode, int port) {
+        if (routeNode.Type == NodeType.Condition) return GetPortChain(flow, routeNode.Id, port);
+        var portEdge  = flow.Edges.Find(e => e.FromNodeId == routeNode.Id && e.FromPortIndex == port);
+        var firstNode = portEdge != null ? flow.Nodes.Find(n => n.Id == portEdge.ToNodeId) : null;
+        return firstNode?.Type == NodeType.Condition
+            ? GetPortChain(flow, firstNode.Id, 0)   // condition gate → its true-port chain
+            : GetPortChain(flow, routeNode.Id, port);
+    }
+
+    // Strict priority selector: walk ports top→bottom, surface the first eligible one.
+    // Higher ports preempt lower ones immediately; a preempted port keeps its chain progress.
+    private static void ResolveBranch(ComboFlow flow, FlowRunState state, FlowNode branchNode) {
         state.ActiveBranchNodeId = branchNode.Id;
 
         if (!state.BranchStates.TryGetValue(branchNode.Id, out var bs)) {
@@ -213,51 +227,45 @@ internal static class FlowExecutor {
             state.BranchStates[branchNode.Id] = bs;
         }
 
-        var fallbackPort  = -1;
-        List<FlowNode>? fallbackChain = null;
-
         for (var port = 0; port < branchNode.OutputCount; port++) {
             var portEdge  = flow.Edges.Find(e => e.FromNodeId == branchNode.Id && e.FromPortIndex == port);
             var firstNode = portEdge != null ? flow.Nodes.Find(n => n.Id == portEdge.ToNodeId) : null;
+            if (firstNode == null) continue;
 
-            if (firstNode?.Type == NodeType.Condition) {
-                if (!EvaluateCondition(flow.Job, firstNode)) continue;
-                var condChain = GetPortChain(flow, firstNode.Id, 0);
-                if (condChain.Count == 0) continue;
-                // Condition true → take this branch immediately, no usability check.
-                // Icon update + game queue handles timing; player sees intent, game fires on GCD expiry.
-                EnterCondition(flow, state, firstNode);
-                return;
+            List<FlowNode> chain;
+            if (firstNode.Type == NodeType.Condition) {
+                if (!EvaluateCondition(flow.Job, firstNode)) continue;   // gate closed → next port
+                chain = GetPortChain(flow, firstNode.Id, 0);
+            } else {
+                chain = GetPortChain(flow, branchNode.Id, port);
             }
-
-            var chain = GetPortChain(flow, branchNode.Id, port);
             if (chain.Count == 0) continue;
+
             var progress = bs.GetProgress(port);
             if (progress >= chain.Count) { bs.SetProgress(port, 0); progress = 0; }
-            if (fallbackPort < 0) { fallbackPort = port; fallbackChain = chain; }
-            if (IsActionUsable(chain[progress].ActionId)) {
-                bs.ActivePort           = port;
-                state.CurrentBranchId   = branchNode.Id;
-                state.CurrentBranchPort = port;
-                state.NextActionId      = chain[progress].Id;
-                return;
+            var cand = chain[progress];
+
+            // oGCD ports are eligible only inside the weave window and when actually usable.
+            if (cand.IsOgcd) {
+                if (!WeaveWindowOpen(state))         continue;
+                if (!IsUsableForWeave(cand.ActionId)) continue;
             }
+            // GCD ports win by priority alone — the game queues until the GCD is ready.
+
+            bs.ActivePort           = port;
+            state.CurrentBranchId   = branchNode.Id;
+            state.CurrentBranchPort = port;
+            state.NextActionId      = cand.Id;
+            return;
         }
 
-        // All direct ports on GCD — fall back to first connected direct port.
-        if (fallbackPort >= 0) {
-            var progress = bs.GetProgress(fallbackPort);
-            if (progress >= fallbackChain!.Count) { bs.SetProgress(fallbackPort, 0); progress = 0; }
-            bs.ActivePort           = fallbackPort;
-            state.CurrentBranchId   = branchNode.Id;
-            state.CurrentBranchPort = fallbackPort;
-            state.NextActionId      = fallbackChain![progress].Id;
-        } else {
-            state.NextActionId = "";
-        }
+        // Nothing eligible this frame — fall back to the raw trigger; keep re-evaluating.
+        state.CurrentBranchId = null;
+        state.NextActionId    = "";
     }
 
     private static void EnterCondition(ComboFlow flow, FlowRunState state, FlowNode condNode) {
+        state.ActiveBranchNodeId = condNode.Id;
         bool result = EvaluateCondition(flow.Job, condNode);
         int  port   = result ? 0 : 1;
         var  chain  = GetPortChain(flow, condNode.Id, port);
@@ -306,9 +314,40 @@ internal static class FlowExecutor {
         return chain;
     }
 
-    private static unsafe bool IsActionUsable(uint actionId) {
+    // True while a GCD is rolling, the weave budget isn't spent, and the window hasn't closed.
+    private static bool WeaveWindowOpen(FlowRunState state) =>
+        WeaveHelper.IsGcdRolling
+        && state.WeavedThisWindow < 2
+        && !WeaveHelper.IsWeaveWindowExpired();
+
+    // Tolerance below which the oGCD's own recast is treated as "ready" — covers the brief
+    // animation-lock gap after casting (a GCD or a prior weave) without over-showing on-CD oGCDs.
+    private const float RecastReadyTolerance = 0.7f;
+
+    // Usable for weaving: resolves the evolved (adjusted) id, and shows the oGCD through animation
+    // locks while still hiding it when genuinely on cooldown or short on resources.
+    //
+    // GetActionStatus conflates resources, the oGCD's own cooldown, and the current animation lock
+    // into one error code, so we split them apart:
+    //   1. status == 0                       → usable right now.
+    //   2. resources missing                 → genuine block (no MP/Darkside/range/level).
+    //   3. resources OK but status != 0      → blocked by GCD/own-CD/anim-lock; tolerate only when
+    //                                           the oGCD's OWN recast is effectively ready.
+    private static unsafe bool IsUsableForWeave(uint actionId) {
         var mgr = ActionManager.Instance();
-        return mgr != null && mgr->GetActionStatus(ActionType.Action, actionId) == 0;
+        if (mgr == null) return false;
+        var adj = mgr->GetAdjustedActionId(actionId);
+
+        if (mgr->GetActionStatus(ActionType.Action, adj) == 0)
+            return true;
+
+        // checkRecastActive:false, checkCastingActive:false → ignores cooldown, GCD, anim-lock & casts.
+        var resourcesOk = mgr->GetActionStatus(ActionType.Action, adj, 0xE000_0000, false, false) == 0;
+        if (!resourcesOk) return false;
+
+        var remaining = mgr->GetRecastTime(ActionType.Action, adj)
+                      - mgr->GetRecastTimeElapsed(ActionType.Action, adj);
+        return remaining < RecastReadyTolerance;
     }
 
     private static void TrackWeaveCount(ComboFlow flow, FlowRunState state) {
