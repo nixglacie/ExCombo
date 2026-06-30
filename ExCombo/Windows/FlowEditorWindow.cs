@@ -24,6 +24,7 @@ public class FlowEditorWindow : Window {
     private string  _pickerLastSearch = "\0";
     private readonly List<(uint Id, string Name, uint Icon, byte Level, bool IsPvp)> _pickerResults = new();
     private HashSet<uint>? _pickerJobCategoryIds;
+    private HashSet<uint>? _pickerJobExclusiveCategoryIds;
     private bool _pickerPvpTab;
     private string? _branchEditNodeId;
     private int     _branchEditCount;
@@ -38,10 +39,15 @@ public class FlowEditorWindow : Window {
     private int     _condEditOp;
     private int     _condEditVal;
 
+    private string? _noteEditNodeId;
+    private string  _noteEditText = "";
+    private string? _resizingNoteId;
+
     // Deferred popup opens — set inside popup contexts, opened outside
     private bool _pendingOpenPicker;
     private bool _pendingOpenBranchEdit;
     private bool _pendingOpenCondEdit;
+    private bool _pendingOpenNoteEdit;
 
     private static readonly Dictionary<string, uint> _jobIconCache = new();
 
@@ -118,9 +124,15 @@ public class FlowEditorWindow : Window {
     }
 
     private static float NodeHeight(FlowNode n) =>
-        n.Type is NodeType.Branch or NodeType.Condition
-            ? MathF.Max(NodeSize.Y, BranchSlotH * n.OutputCount)
-            : NodeSize.Y;
+        n.Type == NodeType.Note
+            ? n.NoteH
+            : n.Type is NodeType.Branch or NodeType.Condition
+                ? MathF.Max(NodeSize.Y, BranchSlotH * n.OutputCount)
+                : NodeSize.Y;
+
+    private const float NoteMinW = 96f;
+    private const float NoteMinH = 64f;
+    private static float NodeWidthOf(FlowNode n) => n.Type == NodeType.Note ? n.NoteW : NodeSize.X;
 
     private static uint Col(float r, float g, float b, float a = 1f) =>
         ImGui.ColorConvertFloat4ToU32(new Vector4(r, g, b, a));
@@ -282,8 +294,9 @@ public class FlowEditorWindow : Window {
             if (!gany) continue;
             const float GPad = 11f;
             const float GTop = 38f;
+            const float GBot = 17f; // extra room for the chain badge that hangs below the node's bottom edge
             var gMin = canvasMin + _canvasOffset + new Vector2(gx - GPad, gy - GTop);
-            var gMax = canvasMin + _canvasOffset + new Vector2(gx2 + GPad, gy2 + GPad);
+            var gMax = canvasMin + _canvasOffset + new Vector2(gx2 + GPad, gy2 + GBot);
             dl.AddRectFilled(gMin, gMax, Col(1f, 0.7f, 0.2f, 0.08f), 8f);
             dl.AddRect(gMin, gMax, Col(1f, 0.7f, 0.2f, 0.7f), 8f, ImDrawFlags.None, 2f);
             dl.AddText(gMin + new Vector2(8f, 6f), Col(1f, 0.8f, 0.4f, 0.95f), "Combo");
@@ -317,7 +330,7 @@ public class FlowEditorWindow : Window {
             foreach (var n in _flow.Nodes) {
                 if (!_selectedNodeIds.Contains(n.Id)) continue;
                 if (n.X < ex) ex = n.X;  if (n.Y < ey) ey = n.Y;
-                var nx = n.X + NodeSize.X; var ny = n.Y + NodeHeight(n);
+                var nx = n.X + NodeWidthOf(n); var ny = n.Y + NodeHeight(n);
                 if (nx > ex2) ex2 = nx;   if (ny > ey2) ey2 = ny;
                 any = true;
             }
@@ -338,14 +351,21 @@ public class FlowEditorWindow : Window {
             var isTrigger   = node.Type == NodeType.Trigger;
             var isBranch    = node.Type == NodeType.Branch;
             var isCondition = node.Type == NodeType.Condition;
+            var isNote      = node.Type == NodeType.Note;
             var nodeH       = NodeHeight(node);
+            var nodeW       = NodeWidthOf(node);
             var sp          = canvasMin + _canvasOffset + new Vector2(node.X, node.Y);
             var inPort      = sp + new Vector2(0f, nodeH * 0.5f);
 
             // ── Output port hover detection ───────────────────────────────
             bool overOutPort    = false;
             int  overOutPortIdx = 0;
-            if (isBranch || isCondition) {
+            bool overNoteResize = false;
+            if (isNote) {
+                // Note nodes are pure comments — no ports; bottom-right corner = resize handle.
+                if (_wireFromNodeId == null)
+                    overNoteResize = Vector2.Distance(mouse2, sp + new Vector2(nodeW, nodeH)) < 12f;
+            } else if (isBranch || isCondition) {
                 if (_wireFromNodeId == null) {
                     for (var p = 0; p < node.OutputCount; p++) {
                         var portPos = sp + new Vector2(NodeSize.X, (p + 0.5f) * BranchSlotH);
@@ -362,7 +382,7 @@ public class FlowEditorWindow : Window {
             }
 
             ImGui.SetCursorScreenPos(sp);
-            ImGui.InvisibleButton($"node_{node.Id}", new Vector2(NodeSize.X, nodeH));
+            ImGui.InvisibleButton($"node_{node.Id}", new Vector2(nodeW, nodeH));
             var nodeHovered = ImGui.IsItemHovered();
             var nodeActive  = ImGui.IsItemActive();
 
@@ -377,8 +397,26 @@ public class FlowEditorWindow : Window {
                 }
             }
 
+            // ── Note resize (bottom-right handle) ─────────────────────────
+            if (overNoteResize && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+                _resizingNoteId = node.Id;
+            if (_resizingNoteId == node.Id) {
+                if (ImGui.IsMouseDragging(ImGuiMouseButton.Left)) {
+                    var rd = ImGui.GetIO().MouseDelta;
+                    node.NoteW = MathF.Max(NoteMinW, node.NoteW + rd.X);
+                    node.NoteH = MathF.Max(NoteMinH, node.NoteH + rd.Y);
+                }
+                if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) {
+                    node.NoteW = MathF.Max(NoteMinW, MathF.Round(node.NoteW / GridStep) * GridStep);
+                    node.NoteH = MathF.Max(NoteMinH, MathF.Round(node.NoteH / GridStep) * GridStep);
+                    _resizingNoteId = null;
+                    _config.Save();
+                }
+            }
+
             // ── Drag ──────────────────────────────────────────────────────
-            if (nodeActive && ImGui.IsMouseDragging(ImGuiMouseButton.Left) && _wireFromNodeId != node.Id) {
+            if (nodeActive && ImGui.IsMouseDragging(ImGuiMouseButton.Left)
+                && _wireFromNodeId != node.Id && _resizingNoteId != node.Id && !overNoteResize) {
                 _draggingNodeId = node.Id;
                 var delta = ImGui.GetIO().MouseDelta;
                 if (_selectedNodeIds.Contains(node.Id)) {
@@ -414,9 +452,10 @@ public class FlowEditorWindow : Window {
             }
 
             if (nodeHovered && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
-                if (isBranch)       OpenBranchEdit(node.Id, node.OutputCount);
+                if (isBranch)         OpenBranchEdit(node.Id, node.OutputCount);
                 else if (isCondition) OpenConditionEdit(node.Id);
-                else                OpenPicker(node.Id);
+                else if (isNote)      OpenNoteEdit(node.Id);
+                else                  OpenPicker(node.Id);
             }
 
             if (nodeHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
@@ -429,7 +468,50 @@ public class FlowEditorWindow : Window {
 
             // ── Draw node ─────────────────────────────────────────────────
             var isSelected = _selectedNodeIds.Contains(node.Id);
-            if (isBranch) {
+            if (isNote) {
+                // ── Note node draw (pure comment, no ports) ───────────────
+                var noteAccent = Col(1f, 1f, 1f);
+                var borderCol  = isSelected
+                    ? Col(1f, 1f, 1f)
+                    : nodeHovered || nodeActive
+                        ? noteAccent
+                        : Col(1f, 1f, 1f, 0.45f);
+                dl.AddRectFilled(sp, sp + new Vector2(nodeW, nodeH), Col(0.12f, 0.12f, 0.13f, 0.95f), 6f);
+                dl.AddRect(sp, sp + new Vector2(nodeW, nodeH), borderCol, 6f, ImDrawFlags.None,
+                    isSelected || nodeHovered ? 2f : 1.5f);
+
+                var noteTitle = "Note";
+                var noteTitleW = ImGui.CalcTextSize(noteTitle).X;
+                DrawHelpers.DrawText(dl, sp + new Vector2((nodeW - noteTitleW) * 0.5f, -16f), noteTitle, noteAccent, true);
+
+                var noteText = node.NoteText != "" ? node.NoteText : "Double-click to edit note";
+                var noteCol  = node.NoteText != "" ? Col(0.96f, 0.96f, 0.97f) : Col(0.55f, 0.56f, 0.58f);
+                const float tPad = 6f;
+                dl.PushClipRect(sp + new Vector2(tPad, tPad), sp + new Vector2(nodeW - tPad, nodeH - tPad), true);
+                dl.AddText(ImGui.GetFont(), ImGui.GetFontSize(), sp + new Vector2(tPad, tPad),
+                    noteCol, noteText, nodeW - 2f * tPad);
+                dl.PopClipRect();
+
+                // Delete button (top-right)
+                if (nodeHovered) {
+                    var xBtn = sp + new Vector2(nodeW - 7f, 7f);
+                    const float XBr = 7f;
+                    const float XS  = 3f;
+                    var xHov = Vector2.Distance(mouse2, xBtn) < XBr;
+                    dl.AddCircleFilled(xBtn, XBr, xHov ? Col(0.75f, 0.15f, 0.15f) : Col(0.20f, 0.08f, 0.08f, 0.9f));
+                    dl.AddCircle(xBtn, XBr, Col(1f, 0.3f, 0.3f, 0.8f), 12, 1.2f);
+                    dl.AddLine(xBtn + new Vector2(-XS, -XS), xBtn + new Vector2(XS, XS), Col(1f, 1f, 1f, 0.9f), 1.5f);
+                    dl.AddLine(xBtn + new Vector2(XS, -XS), xBtn + new Vector2(-XS, XS), Col(1f, 1f, 1f, 0.9f), 1.5f);
+                    if (xHov && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+                        _pendingDeleteNodeId = node.Id;
+                }
+
+                // Resize handle (bottom-right corner)
+                if (overNoteResize || _resizingNoteId == node.Id) ImGui.SetMouseCursor(ImGuiMouseCursor.ResizeNwse);
+                var hc = sp + new Vector2(nodeW, nodeH);
+                var handleCol = overNoteResize || _resizingNoteId == node.Id ? noteAccent : Col(1f, 1f, 1f, 0.5f);
+                dl.AddTriangleFilled(hc + new Vector2(-12f, -2f), hc + new Vector2(-2f, -2f), hc + new Vector2(-2f, -12f), handleCol);
+            } else if (isBranch) {
                 var borderCol = isSelected
                     ? Col(1f, 1f, 1f)
                     : nodeHovered || nodeActive
@@ -572,6 +654,39 @@ public class FlowEditorWindow : Window {
 
                 dl.AddRect(sp, sp + NodeSize, borderCol, 6f, ImDrawFlags.None, isSelected || nodeHovered ? 2f : 1.5f);
 
+                // Status badges — centered on the bottom edge (half below). oGCD = lightning,
+                // combo-group = chain. When a node has both, lay them out as a centered pair.
+                if (!isTrigger && (node.IsOgcd || node.GroupId != null)) {
+                    ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
+                    const float pad = 3f, gap = 4f;
+                    var darkCol = Col(0.07f, 0.08f, 0.11f, 1f);
+
+                    var boltStr = FontAwesomeIcon.Bolt.ToIconString();
+                    var linkStr = FontAwesomeIcon.Link.ToIconString();
+                    var boltGsz = ImGui.CalcTextSize(boltStr);
+                    var linkGsz = ImGui.CalcTextSize(linkStr);
+                    var boltW   = boltGsz.X + 2f * pad;
+                    var linkW   = linkGsz.X + 2f * pad;
+
+                    var hasBolt  = node.IsOgcd;
+                    var hasLink  = node.GroupId != null;
+                    var totalW   = (hasBolt ? boltW : 0f) + (hasLink ? linkW : 0f) + (hasBolt && hasLink ? gap : 0f);
+                    var x        = sp.X + (NodeSize.X - totalW) * 0.5f;
+
+                    void Badge(string glyph, Vector2 gsz, float w, uint bg, float gdx) {
+                        var bMin = new Vector2(x, sp.Y + NodeSize.Y - (gsz.Y + 2f * pad) * 0.5f);
+                        var bMax = bMin + new Vector2(w, gsz.Y + 2f * pad);
+                        dl.AddRectFilled(bMin, bMax, bg, 4f);
+                        dl.AddRect(bMin, bMax, darkCol, 4f, ImDrawFlags.None, 1.5f);
+                        dl.AddText(bMin + new Vector2(pad + gdx, pad - 1f), darkCol, glyph);
+                        x += w + gap;
+                    }
+
+                    if (hasBolt) Badge(boltStr, boltGsz, boltW, Col(1f, 0.85f, 0.2f, 1f), 0f);
+                    if (hasLink) Badge(linkStr, linkGsz, linkW, Col(1f, 0.7f, 0.2f, 1f), 0.5f);
+                    ImGui.PopFont();
+                }
+
                 var label      = node.ActionLabel != "" ? node.ActionLabel : (isTrigger ? "Trigger" : "Action");
                 var labelWidth = ImGui.CalcTextSize(label).X;
                 var labelPos   = sp + new Vector2((NodeSize.X - labelWidth) * 0.5f, -16f);
@@ -609,6 +724,8 @@ public class FlowEditorWindow : Window {
                     if (IconMenuItem(FontAwesomeIcon.Filter, "Edit Job Condition", Col(0.900f, 0.630f, 0.310f))) OpenConditionEdit(node.Id);
                 } else if (isBranch) {
                     if (IconMenuItem(FontAwesomeIcon.List,   "Edit Outputs", Col(0.700f, 0.400f, 1.000f))) OpenBranchEdit(node.Id, node.OutputCount);
+                } else if (isNote) {
+                    if (IconMenuItem(FontAwesomeIcon.Edit,   "Edit Note", Col(0.95f, 0.95f, 0.96f))) OpenNoteEdit(node.Id);
                 } else {
                     if (IconMenuItem(FontAwesomeIcon.Edit,   "Edit Action",
                             isTrigger ? Col(0.635f, 0.855f, 0.549f) : Col(0.455f, 0.765f, 1.000f))) OpenPicker(node.Id);
@@ -732,7 +849,7 @@ public class FlowEditorWindow : Window {
             if (!ImGui.GetIO().KeyCtrl) _selectedNodeIds.Clear();
             foreach (var n in _flow.Nodes) {
                 var nsp  = canvasMin + _canvasOffset + new Vector2(n.X, n.Y);
-                var nMax = nsp + new Vector2(NodeSize.X, NodeHeight(n));
+                var nMax = nsp + new Vector2(NodeWidthOf(n), NodeHeight(n));
                 if (nsp.X < rMax.X && nMax.X > rMin.X && nsp.Y < rMax.Y && nMax.Y > rMin.Y)
                     _selectedNodeIds.Add(n.Id);
             }
@@ -747,6 +864,7 @@ public class FlowEditorWindow : Window {
             if (IconMenuItem(FontAwesomeIcon.Magic,       "Add Action",    Col(0.455f, 0.765f, 1.000f))) AddNode(NodeType.Action);
             if (IconMenuItem(FontAwesomeIcon.CodeBranch,  "Add Priority",  Col(0.700f, 0.400f, 1.000f))) AddNode(NodeType.Branch);
             if (IconMenuItem(FontAwesomeIcon.Filter,      "Add Job Condition", Col(0.900f, 0.630f, 0.310f))) AddConditionNode();
+            if (IconMenuItem(FontAwesomeIcon.StickyNote,  "Add Note",      Col(0.95f, 0.95f, 0.96f))) AddNoteNode();
             if (_clipboardNodes != null) {
                 ImGui.Separator();
                 if (IconMenuItem(FontAwesomeIcon.Paste, $"Paste ({_clipboardNodes.Count} nodes)", Col(0.55f, 0.85f, 0.50f))) {
@@ -795,11 +913,13 @@ public class FlowEditorWindow : Window {
         if (_pendingOpenPicker)     { ImGui.OpenPopup("Pick Action##picker");        _pendingOpenPicker     = false; }
         if (_pendingOpenBranchEdit) { ImGui.OpenPopup("Priority Outputs##branchedit"); _pendingOpenBranchEdit = false; }
         if (_pendingOpenCondEdit)   { ImGui.OpenPopup("Edit Condition##condedit");   _pendingOpenCondEdit   = false; }
+        if (_pendingOpenNoteEdit)   { ImGui.OpenPopup("Edit Note##noteedit");        _pendingOpenNoteEdit   = false; }
 
         // ── Modals ────────────────────────────────────────────────────────
         DrawActionPicker();
         DrawBranchEdit();
         DrawConditionEdit();
+        DrawNoteEdit();
     }
 
     private void AddNode(NodeType type) {
@@ -824,6 +944,62 @@ public class FlowEditorWindow : Window {
         _flow!.Nodes.Add(node);
         _config.Save();
         OpenConditionEdit(node.Id);
+    }
+
+    private void AddNoteNode() {
+        var node = new FlowNode {
+            Type = NodeType.Note,
+            X    = MathF.Round((_contextMenuCanvasPos.X - 160f * 0.5f) / GridStep) * GridStep,
+            Y    = MathF.Round((_contextMenuCanvasPos.Y - NodeSize.Y * 0.5f) / GridStep) * GridStep,
+        };
+        _flow!.Nodes.Add(node);
+        _config.Save();
+        OpenNoteEdit(node.Id);
+    }
+
+    private void OpenNoteEdit(string nodeId) {
+        _noteEditNodeId      = nodeId;
+        _noteEditText        = _flow!.Nodes.Find(n => n.Id == nodeId)?.NoteText ?? "";
+        _pendingOpenNoteEdit = true;
+    }
+
+    private void DrawNoteEdit() {
+        if (_noteEditNodeId == null) return;
+
+        ImGui.SetNextWindowSizeConstraints(new Vector2(300, 180), new Vector2(600, 400));
+        ImGui.SetNextWindowSize(new Vector2(340, 200), ImGuiCond.FirstUseEver);
+        if (!ImGui.BeginPopupModal("Edit Note##noteedit", ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)) return;
+
+        ImGui.TextDisabled("Note text");
+        ImGui.InputTextMultiline("##notetext", ref _noteEditText, 1024,
+            new Vector2(-1f, -ImGui.GetFrameHeightWithSpacing() - ImGui.GetStyle().ItemSpacing.Y));
+
+        var btnW = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+
+        ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.92f, 0.92f, 0.94f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.98f, 0.98f, 1.00f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.82f, 0.82f, 0.85f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.102f, 0.106f, 0.118f, 1f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
+        if (ImGui.Button("OK", new Vector2(btnW, 0f))) {
+            var node = _flow!.Nodes.Find(n => n.Id == _noteEditNodeId);
+            if (node != null) { node.NoteText = _noteEditText; _config.Save(); }
+            _noteEditNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.PopStyleVar();
+        ImGui.PopStyleColor(4);
+
+        ImGui.SameLine();
+
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
+        if (ImGui.Button("Cancel", new Vector2(btnW, 0f))) {
+            _noteEditNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.PopStyleVar();
+
+        ImGui.EndPopup();
     }
 
     private void OpenBranchEdit(string nodeId, int currentCount) {
@@ -975,16 +1151,29 @@ public class FlowEditorWindow : Window {
         ImGui.PopStyleColor(4);
     }
 
+    private static readonly string[] _allJobs = {
+        "GNB", "PLD", "WAR", "DRK", "WHM", "SCH", "AST", "SGE", "MNK", "DRG", "NIN",
+        "SAM", "RPR", "VPR", "BRD", "MCH", "DNC", "BLM", "SMN", "RDM", "PCT"
+    };
+
     private void BuildJobCategorySet() {
-        _pickerJobCategoryIds = null;
+        _pickerJobCategoryIds          = null;
+        _pickerJobExclusiveCategoryIds = null;
         var job = _flow?.Job;
         if (string.IsNullOrEmpty(job)) return;
         var catSheet = Plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.ClassJobCategory>();
         if (catSheet == null) return;
-        _pickerJobCategoryIds = new HashSet<uint>();
-        foreach (var cat in catSheet)
-            if (CategoryHasJob(cat, job))
-                _pickerJobCategoryIds.Add(cat.RowId);
+        _pickerJobCategoryIds          = new HashSet<uint>();
+        _pickerJobExclusiveCategoryIds = new HashSet<uint>();
+        foreach (var cat in catSheet) {
+            if (!CategoryHasJob(cat, job)) continue;
+            _pickerJobCategoryIds.Add(cat.RowId);
+            // Exclusive = only this job's flag set; evolved/combo actions (e.g. Continuation) live
+            // here. Broad categories (roles, "all classes") are skipped so they don't leak junk.
+            var count = 0;
+            foreach (var j in _allJobs) { if (CategoryHasJob(cat, j)) count++; if (count > 1) break; }
+            if (count == 1) _pickerJobExclusiveCategoryIds.Add(cat.RowId);
+        }
     }
 
     private static bool CategoryHasJob(Lumina.Excel.Sheets.ClassJobCategory cat, string job) => job switch {
@@ -1003,13 +1192,22 @@ public class FlowEditorWindow : Window {
         if (sheet == null) return;
 
         var query = _pickerSearch.Trim();
+        var jobScoped = _pickerJobCategoryIds != null;
 
         foreach (var row in sheet) {
-            if (!row.IsPlayerAction && !row.IsPvP) continue;
+            var assignable = row.IsPlayerAction || row.IsPvP;
+            var catId      = row.ClassJobCategory.RowId;
+            // Assignable actions: keep, scoped to the job's categories below.
+            // Non-assignable actions (evolved combos like Continuation, hidden by the game from
+            // hotbars but still targetable by id): only when job-scoped AND in this job's
+            // exclusive single-job category, so we don't pull in unrelated unassignable junk.
+            if (!assignable) {
+                if (!jobScoped || !_pickerJobExclusiveCategoryIds!.Contains(catId)) continue;
+            }
             var name = row.Name.ToString();
             if (name == "") continue;
             if (!name.Contains(query, StringComparison.OrdinalIgnoreCase)) continue;
-            if (_pickerJobCategoryIds != null && !_pickerJobCategoryIds.Contains(row.ClassJobCategory.RowId)) continue;
+            if (jobScoped && assignable && !_pickerJobCategoryIds!.Contains(catId)) continue;
             _pickerResults.Add((row.RowId, name, (uint)row.Icon, row.ClassJobLevel, row.IsPvP));
             if (_pickerResults.Count >= 200) break;
         }

@@ -7,6 +7,7 @@ public enum NodeType {
     Action    = 1,
     Branch    = 2,
     Condition = 3,
+    Note      = 4,
 }
 
 public class FlowNode {
@@ -26,6 +27,12 @@ public class FlowNode {
 
     // Cached oGCD hint for the editor UI; the executor derives this live via ActionHelper.IsOgcd.
     public bool IsOgcd { get; set; } = false;
+
+    // Free text for Note nodes (no input/output; pure comment, ignored by the executor).
+    public string NoteText { get; set; } = "";
+    // Note node box size (grid-snapped, user-resizable).
+    public float  NoteW    { get; set; } = 160f;
+    public float  NoteH    { get; set; } = 64f;
 
     // Non-null id shared by nodes forming an atomic combo group (runs to completion before
     // the branch re-evaluates priority). Null = ungrouped.
