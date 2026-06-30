@@ -105,9 +105,7 @@ internal static class FlowExecutor {
                     for (var guard = 0; guard < 20; guard++) {
                         var cur = flow.Nodes.Find(n => n.Id == s.NextActionId);
                         if (cur == null || !ActionHelper.IsOgcd(cur.ActionId)) break;
-                        bool shouldSkip = WeaveHelper.IsWeaveWindowExpired()
-                                       || (WeaveHelper.IsGcdRolling && s.WeavedThisWindow >= 2);
-                        if (!shouldSkip) break;
+                        if (OgcdOffer(s, cur)) break;   // still weaveable (or in grace) → hold
                         if (s.LastTickSkipId != cur.Id) {
                             Plugin.Log.Debug($"[ExCombo][Tick] trigger={trigger.ActionId} skipping oGCD={cur.ActionId} weaved={s.WeavedThisWindow}");
                             s.LastTickSkipId = cur.Id;
@@ -135,8 +133,11 @@ internal static class FlowExecutor {
         if (state.PendingFire) return state.FrozenReturn;
 
         var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
-        if (node != null && ActionHelper.IsOgcd(node.ActionId) && !WeaveWindowOpen(state))
-            return triggerActionId;
+        if (node != null && ActionHelper.IsOgcd(node.ActionId)) {
+            if (OgcdOffer(state, node)) return node.ActionId;          // weaveable → offer it
+            var spine = SpineLookahead(flow, state);                  // else show the next GCD
+            return spine != 0 ? spine : triggerActionId;
+        }
         return node?.ActionId ?? triggerActionId;
     }
 
@@ -167,11 +168,19 @@ internal static class FlowExecutor {
     public static void NotifyQueued(ComboFlow flow, FlowNode trigger, uint frozenReturn) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
         var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
-        if (node != null && ActionHelper.IsOgcd(node.ActionId) && (state.WeavedThisWindow >= 2 || WeaveHelper.IsWeaveWindowExpired())) {
-            // Weave limit hit or window expired — skip oGCD and let queue fire the trigger as-is
+        if (node != null && ActionHelper.IsOgcd(node.ActionId) && !OgcdOffer(state, node)) {
+            // oGCD not weaveable (CD / proc down / window closed / weave limit) — skip it (and any
+            // consecutive oGCDs) and let the queue fire the next GCD spine as-is. Evaluate grace
+            // against the prior cast before stamping LastPressedTick.
+            for (var guard = 0; guard < 20; guard++) {
+                var cur = flow.Nodes.Find(n => n.Id == state.NextActionId);
+                if (cur == null || !ActionHelper.IsOgcd(cur.ActionId) || OgcdOffer(state, cur)) break;
+                var prevId = state.NextActionId;
+                AdvanceState(flow, trigger, state);
+                if (state.NextActionId == "" || state.NextActionId == prevId) break;
+            }
             state.LastPressedTick = Environment.TickCount64;
-            AdvanceState(flow, trigger, state);
-            Plugin.Log.Debug($"[ExCombo][Queue] trigger={trigger.ActionId} oGCD blocked weaved={state.WeavedThisWindow} expired={WeaveHelper.IsWeaveWindowExpired()}, advanced to {state.NextActionId}");
+            Plugin.Log.Debug($"[ExCombo][Queue] trigger={trigger.ActionId} oGCD skipped, advanced to {state.NextActionId}");
             return;
         }
         state.PendingFire     = true;
@@ -265,7 +274,13 @@ internal static class FlowExecutor {
 
         List<FlowNode> chain;
         if (firstNode.Type == NodeType.Condition) {
-            if (!EvaluateCondition(flow.Job, firstNode)) return null;   // gate closed
+            // Mid-chain: gate already passed at entry; let the started chain finish (e.g. the
+            // Continuation that follows a Burst Strike which just spent the cartridge the gate reads).
+            bool midChain = port == bs.ActivePort && bs.GetProgress(port) > 0;
+            if (!midChain) {
+                if (!EvaluateCondition(flow.Job, firstNode)) return null;   // gate closed at entry
+                bs.SetProgress(port, 0);                                    // fresh entry → chain head
+            }
             chain = GetPortChain(flow, firstNode.Id, 0);
         } else {
             chain = GetPortChain(flow, branchNode.Id, port);
@@ -330,8 +345,32 @@ internal static class FlowExecutor {
 
             // oGCD ports are eligible only inside the weave window and when actually usable.
             if (ActionHelper.IsOgcd(rr.cand.ActionId)) {
-                if (!WeaveWindowOpen(state))            continue;
-                if (!IsUsableForWeave(rr.cand.ActionId)) continue;
+                // A mid-chain oGCD continuation (e.g. Hypervelocity after Burst Strike) is enabled by
+                // a buff the game applies a frame late. Within the grace window hold it instead of
+                // letting a lower-priority port preempt it; otherwise honour usability as normal.
+                bool midChain    = port == bs.ActivePort && rr.progress > 0;
+                bool withinGrace = Environment.TickCount64 - state.LastPressedTick <= ComboGraceMs;
+                bool offerable   = WeaveWindowOpen(state)
+                                && (IsUsableForWeave(rr.cand.ActionId) || (midChain && withinGrace));
+                if (!offerable) {
+                    // A mid-chain inline oGCD we can't weave must not block the spine or surrender
+                    // priority — skip it (and any consecutive oGCDs) and surface the next GCD in THIS
+                    // chain, keeping the port active. Fresh oGCD-led ports still drop as before.
+                    if (midChain) {
+                        var i = rr.progress;
+                        while (i < rr.chain.Count && ActionHelper.IsOgcd(rr.chain[i].ActionId)) i++;
+                        if (i < rr.chain.Count) {
+                            Plugin.Log.Debug($"[ExCombo][Branch] skip oGCD={rr.cand.ActionId} → next={rr.chain[i].ActionId}");
+                            bs.SetProgress(port, i);
+                            bs.ActivePort           = port;
+                            state.CurrentBranchId   = branchNode.Id;
+                            state.CurrentBranchPort = port;
+                            state.NextActionId      = rr.chain[i].Id;
+                            return;
+                        }
+                    }
+                    continue;   // fresh oGCD-led port not ready, or no GCD left in chain → lower priority
+                }
             }
             // GCD ports win by priority alone — the game queues until the GCD is ready.
 
@@ -430,6 +469,39 @@ internal static class FlowExecutor {
         WeaveHelper.IsGcdRolling
         && state.WeavedThisWindow < 2
         && !WeaveHelper.IsWeaveWindowExpired();
+
+    // Should this inline oGCD still be offered (shown/fired) this frame? It's an overlay on the GCD
+    // spine: weave it only inside the window when actually usable, with a short grace after the prior
+    // cast so a buff applied a frame late (e.g. Hypervelocity's Ready To Blast after Burst Strike)
+    // isn't skipped. Otherwise the spine falls through to the next GCD — the oGCD never blocks.
+    private static bool OgcdOffer(FlowRunState state, FlowNode node) {
+        if (!WeaveWindowOpen(state)) return false;
+        if (IsUsableForWeave(node.ActionId)) return true;
+        return Environment.TickCount64 - state.LastPressedTick <= ComboGraceMs;
+    }
+
+    // Peek the next non-oGCD (GCD) action past the current cursor without mutating state; 0 if none.
+    private static uint SpineLookahead(ComboFlow flow, FlowRunState state) {
+        if (state.CurrentBranchId != null) {
+            var routeNode = flow.Nodes.Find(n => n.Id == state.CurrentBranchId);
+            if (routeNode == null || !state.BranchStates.TryGetValue(state.CurrentBranchId, out var bs)) return 0;
+            var chain = GetActiveChain(flow, routeNode, state.CurrentBranchPort);
+            for (var i = bs.GetProgress(state.CurrentBranchPort) + 1; i < chain.Count; i++)
+                if (!ActionHelper.IsOgcd(chain[i].ActionId)) return chain[i].ActionId;
+            return 0;
+        }
+        var current = state.NextActionId;
+        var visited = new HashSet<string>();
+        while (current != "" && visited.Add(current)) {
+            var edge = flow.Edges.Find(e => e.FromNodeId == current && e.FromPortIndex == 0);
+            if (edge == null) return 0;
+            var next = flow.Nodes.Find(n => n.Id == edge.ToNodeId);
+            if (next is not { Type: NodeType.Action }) return 0;
+            if (!ActionHelper.IsOgcd(next.ActionId)) return next.ActionId;
+            current = next.Id;
+        }
+        return 0;
+    }
 
     // Tolerance below which the oGCD's own recast is treated as "ready" — covers the brief
     // animation-lock gap after casting (a GCD or a prior weave) without over-showing on-CD oGCDs.
