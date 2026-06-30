@@ -254,6 +254,40 @@ public class FlowEditorWindow : Window {
             }
         }
 
+        // ── Dismantle any group left with a single node ───────────────────
+        var groupCounts = new Dictionary<string, int>();
+        foreach (var n in _flow.Nodes)
+            if (n.GroupId != null) groupCounts[n.GroupId] = groupCounts.GetValueOrDefault(n.GroupId) + 1;
+        var prunedGroup = false;
+        foreach (var n in _flow.Nodes)
+            if (n.GroupId != null && groupCounts[n.GroupId] < 2) { n.GroupId = null; prunedGroup = true; }
+        if (prunedGroup) { FlowExecutor.InvalidateFlow(_flow.Id); _config.Save(); }
+
+        // ── Combo group boxes (behind everything) ─────────────────────────
+        var groupIds = new HashSet<string>();
+        foreach (var n in _flow.Nodes)
+            if (n.GroupId != null) groupIds.Add(n.GroupId);
+        foreach (var gid in groupIds) {
+            var gx = float.MaxValue; var gy = float.MaxValue;
+            var gx2 = float.MinValue; var gy2 = float.MinValue;
+            var gany = false;
+            foreach (var n in _flow.Nodes) {
+                if (n.GroupId != gid) continue;
+                if (n.X < gx) gx = n.X;  if (n.Y < gy) gy = n.Y;
+                var nx = n.X + NodeSize.X; var ny = n.Y + NodeHeight(n);
+                if (nx > gx2) gx2 = nx;   if (ny > gy2) gy2 = ny;
+                gany = true;
+            }
+            if (!gany) continue;
+            const float GPad = 11f;
+            const float GTop = 38f;
+            var gMin = canvasMin + _canvasOffset + new Vector2(gx - GPad, gy - GTop);
+            var gMax = canvasMin + _canvasOffset + new Vector2(gx2 + GPad, gy2 + GPad);
+            dl.AddRectFilled(gMin, gMax, Col(1f, 0.7f, 0.2f, 0.08f), 8f);
+            dl.AddRect(gMin, gMax, Col(1f, 0.7f, 0.2f, 0.7f), 8f, ImDrawFlags.None, 2f);
+            dl.AddText(gMin + new Vector2(8f, 6f), Col(1f, 0.8f, 0.4f, 0.95f), "Combo");
+        }
+
         // ── Selection envelope (behind nodes) ─────────────────────────────
         if (_selectedNodeIds.Count > 0) {
             var ex = float.MaxValue; var ey = float.MaxValue;
@@ -568,6 +602,11 @@ public class FlowEditorWindow : Window {
                     FlowExecutor.InvalidateFlow(_flow.Id);
                     _config.Save();
                 }
+                if (node.GroupId != null && IconMenuItem(FontAwesomeIcon.ObjectUngroup, "Ungroup")) {
+                    node.GroupId = null;
+                    FlowExecutor.InvalidateFlow(_flow.Id);
+                    _config.Save();
+                }
                 ImGui.EndPopup();
             }
         }
@@ -575,6 +614,22 @@ public class FlowEditorWindow : Window {
         // ── Multi-selection context menu ──────────────────────────────────
         if (ImGui.BeginPopup("##multi_node_ctx")) {
             var selCount = _selectedNodeIds.Count;
+            if (IconMenuItem(FontAwesomeIcon.ObjectGroup, "Group as Combo")) {
+                var gid = Guid.NewGuid().ToString();
+                foreach (var n in _flow.Nodes)
+                    if (_selectedNodeIds.Contains(n.Id) && n.Type == NodeType.Action) n.GroupId = gid;
+                FlowExecutor.InvalidateFlow(_flow.Id);
+                _config.Save();
+                ImGui.CloseCurrentPopup();
+            }
+            if (IconMenuItem(FontAwesomeIcon.ObjectUngroup, "Ungroup")) {
+                foreach (var n in _flow.Nodes)
+                    if (_selectedNodeIds.Contains(n.Id)) n.GroupId = null;
+                FlowExecutor.InvalidateFlow(_flow.Id);
+                _config.Save();
+                ImGui.CloseCurrentPopup();
+            }
+            ImGui.Separator();
             if (IconMenuItem(FontAwesomeIcon.TrashAlt, $"Delete {selCount} nodes")) {
                 foreach (var id in _selectedNodeIds) {
                     _flow.Edges.RemoveAll(e => e.FromNodeId == id || e.ToNodeId == id);
@@ -859,8 +914,7 @@ public class FlowEditorWindow : Window {
                         node.ActionId    = id;
                         node.ActionLabel = name;
                         node.IconId      = icon;
-                        var aRow = Plugin.DataManager.GetExcelSheet<LuminaAction>()?.GetRow(id);
-                        node.IsOgcd      = aRow.HasValue && aRow.Value.CooldownGroup != 57;
+                        node.IsOgcd      = ActionHelper.IsOgcd(id);
                         FlowExecutor.InvalidateFlow(_flow.Id);
                         _config.Save();
                     }

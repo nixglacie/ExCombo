@@ -12,6 +12,8 @@ internal static class FlowExecutor {
         public string? CurrentBranchId     = null;
         public string? ActiveBranchNodeId  = null;
         public int     CurrentBranchPort   = 0;
+        public string? CommittedBranchId   = null;
+        public int     CommittedPort       = -1;
         public readonly Dictionary<string, BranchNodeState> BranchStates = new();
         public bool    PendingFire         = false;
         public uint    FrozenReturn        = 0;
@@ -37,6 +39,9 @@ internal static class FlowExecutor {
 
     private const long ResetAfterMs = 15_000;
 
+    // Grace after a press before trusting the game's combo state (the game records the combo a frame late).
+    private const long ComboGraceMs = 500;
+
     // Set by ActionHook while inside UseAction(a5=1) original call.
     public static bool InQueueExecute = false;
 
@@ -47,7 +52,8 @@ internal static class FlowExecutor {
                 if (trigger.Type != NodeType.Trigger) continue;
                 if (!_states.TryGetValue(Key(flow, trigger), out var s)) continue;
 
-                if (s.LastPressedTick > 0 && (now - s.LastPressedTick) > ResetAfterMs) {
+                // Stay alive while the game's combo is still running (matches the real combo window).
+                if (s.LastPressedTick > 0 && (now - s.LastPressedTick) > ResetAfterMs && ComboHelper.ComboTimer <= 0) {
                     Plugin.Log.Debug($"[ExCombo][Tick] trigger={trigger.ActionId} inactive {ResetAfterMs}ms, resetting");
                     ResetState(s);
                     continue;
@@ -62,11 +68,43 @@ internal static class FlowExecutor {
                 }
                 s.LastGCDElapsed = gcdElapsed;
 
+                // Combo sync: if the next step is a combo continuation the game no longer supports
+                // (timer expired or combo broken by another action), reset this chain to its start.
+                if (!s.PendingFire && s.NextActionId != "" && (now - s.LastPressedTick) > ComboGraceMs) {
+                    var step = flow.Nodes.Find(n => n.Id == s.NextActionId);
+                    if (step is { Type: NodeType.Action }) {
+                        var parent = ComboHelper.GetComboParent(step.ActionId);
+                        if (parent != 0) {
+                            // Only enforce game-combo continuity where the graph actually wires this
+                            // combo step (predecessor action == the prerequisite). Otherwise the graph
+                            // is authoritative and we follow it as-is.
+                            FlowNode? prevAction = null;
+                            foreach (var e in flow.Edges) {
+                                if (e.ToNodeId != step.Id) continue;
+                                var p = flow.Nodes.Find(n => n.Id == e.FromNodeId);
+                                if (p is { Type: NodeType.Action }) { prevAction = p; break; }
+                            }
+                            bool graphModelsCombo = prevAction != null
+                                && (prevAction.ActionId == parent
+                                    || Adjusted(prevAction.ActionId) == parent
+                                    || prevAction.ActionId == Adjusted(parent));
+                            if (graphModelsCombo) {
+                                var ga = ComboHelper.ComboAction;
+                                bool supported = ComboHelper.ComboTimer > 0 && (ga == parent || ga == Adjusted(parent));
+                                if (!supported) {
+                                    Plugin.Log.Debug($"[ExCombo][Combo] trigger={trigger.ActionId} desync (need {parent}, game={ga} t={ComboHelper.ComboTimer:F1}) → reset chain");
+                                    ResetActiveChain(flow, trigger, s);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Auto-skip oGCD nodes when window expired or max weaves (2) reached
                 if (!s.PendingFire && s.NextActionId != "") {
                     for (var guard = 0; guard < 20; guard++) {
                         var cur = flow.Nodes.Find(n => n.Id == s.NextActionId);
-                        if (cur?.IsOgcd != true) break;
+                        if (cur == null || !ActionHelper.IsOgcd(cur.ActionId)) break;
                         bool shouldSkip = WeaveHelper.IsWeaveWindowExpired()
                                        || (WeaveHelper.IsGcdRolling && s.WeavedThisWindow >= 2);
                         if (!shouldSkip) break;
@@ -97,7 +135,7 @@ internal static class FlowExecutor {
         if (state.PendingFire) return state.FrozenReturn;
 
         var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
-        if (node != null && node.IsOgcd && !WeaveWindowOpen(state))
+        if (node != null && ActionHelper.IsOgcd(node.ActionId) && !WeaveWindowOpen(state))
             return triggerActionId;
         return node?.ActionId ?? triggerActionId;
     }
@@ -129,7 +167,7 @@ internal static class FlowExecutor {
     public static void NotifyQueued(ComboFlow flow, FlowNode trigger, uint frozenReturn) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
         var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
-        if (node?.IsOgcd == true && (state.WeavedThisWindow >= 2 || WeaveHelper.IsWeaveWindowExpired())) {
+        if (node != null && ActionHelper.IsOgcd(node.ActionId) && (state.WeavedThisWindow >= 2 || WeaveHelper.IsWeaveWindowExpired())) {
             // Weave limit hit or window expired — skip oGCD and let queue fire the trigger as-is
             state.LastPressedTick = Environment.TickCount64;
             AdvanceState(flow, trigger, state);
@@ -217,8 +255,31 @@ internal static class FlowExecutor {
             : GetPortChain(flow, routeNode.Id, port);
     }
 
-    // Strict priority selector: walk ports top→bottom, surface the first eligible one.
-    // Higher ports preempt lower ones immediately; a preempted port keeps its chain progress.
+    // Chain + current candidate for a branch port; null if disconnected or the condition gate is
+    // closed. No usability/weave gating — callers decide that.
+    private static (List<FlowNode> chain, int progress, FlowNode cand)? ResolvePort(
+            ComboFlow flow, FlowNode branchNode, BranchNodeState bs, int port) {
+        var portEdge  = flow.Edges.Find(e => e.FromNodeId == branchNode.Id && e.FromPortIndex == port);
+        var firstNode = portEdge != null ? flow.Nodes.Find(n => n.Id == portEdge.ToNodeId) : null;
+        if (firstNode == null) return null;
+
+        List<FlowNode> chain;
+        if (firstNode.Type == NodeType.Condition) {
+            if (!EvaluateCondition(flow.Job, firstNode)) return null;   // gate closed
+            chain = GetPortChain(flow, firstNode.Id, 0);
+        } else {
+            chain = GetPortChain(flow, branchNode.Id, port);
+        }
+        if (chain.Count == 0) return null;
+
+        var progress = bs.GetProgress(port);
+        if (progress >= chain.Count) { bs.SetProgress(port, 0); progress = 0; }
+        return (chain, progress, chain[progress]);
+    }
+
+    // Strict priority selector: walk ports top→bottom, surface the first eligible one. Higher ports
+    // preempt lower ones immediately — except a committed combo group holds the branch (only a
+    // strictly-higher oGCD port may weave in) until it completes.
     private static void ResolveBranch(ComboFlow flow, FlowRunState state, FlowNode branchNode) {
         state.ActiveBranchNodeId = branchNode.Id;
 
@@ -227,35 +288,57 @@ internal static class FlowExecutor {
             state.BranchStates[branchNode.Id] = bs;
         }
 
-        for (var port = 0; port < branchNode.OutputCount; port++) {
-            var portEdge  = flow.Edges.Find(e => e.FromNodeId == branchNode.Id && e.FromPortIndex == port);
-            var firstNode = portEdge != null ? flow.Nodes.Find(n => n.Id == portEdge.ToNodeId) : null;
-            if (firstNode == null) continue;
+        // A group port is "committed" once we've advanced PAST its first node (the previous chain
+        // step shares the same group). Group entry stays priority-governed, even with a loose prefix.
+        bool CommitActive(int port) {
+            var r = ResolvePort(flow, branchNode, bs, port);
+            if (r is not { } rr || rr.cand.GroupId == null || rr.progress == 0) return false;
+            return rr.chain[rr.progress - 1].GroupId == rr.cand.GroupId;
+        }
+        if (state.CommittedBranchId == branchNode.Id && state.CommittedPort >= 0 && !CommitActive(state.CommittedPort)) {
+            state.CommittedPort     = -1;
+            state.CommittedBranchId = null;
+        }
+        if (state.CommittedPort < 0 && state.CurrentBranchId == branchNode.Id && CommitActive(state.CurrentBranchPort)) {
+            state.CommittedPort     = state.CurrentBranchPort;
+            state.CommittedBranchId = branchNode.Id;
+        }
 
-            List<FlowNode> chain;
-            if (firstNode.Type == NodeType.Condition) {
-                if (!EvaluateCondition(flow.Job, firstNode)) continue;   // gate closed → next port
-                chain = GetPortChain(flow, firstNode.Id, 0);
-            } else {
-                chain = GetPortChain(flow, branchNode.Id, port);
+        // Committed group holds the branch — only a strictly-higher oGCD port may weave in.
+        if (state.CommittedBranchId == branchNode.Id && state.CommittedPort >= 0) {
+            for (var p = 0; p < state.CommittedPort; p++) {
+                var rp = ResolvePort(flow, branchNode, bs, p);
+                if (rp is not { } w || !ActionHelper.IsOgcd(w.cand.ActionId)) continue;
+                if (!WeaveWindowOpen(state) || !IsUsableForWeave(w.cand.ActionId)) continue;
+                bs.ActivePort           = p;
+                state.CurrentBranchId   = branchNode.Id;
+                state.CurrentBranchPort = p;
+                state.NextActionId      = w.cand.Id;
+                return;
             }
-            if (chain.Count == 0) continue;
+            var g = ResolvePort(flow, branchNode, bs, state.CommittedPort)!.Value;
+            bs.ActivePort           = state.CommittedPort;
+            state.CurrentBranchId   = branchNode.Id;
+            state.CurrentBranchPort = state.CommittedPort;
+            state.NextActionId      = g.cand.Id;
+            return;
+        }
 
-            var progress = bs.GetProgress(port);
-            if (progress >= chain.Count) { bs.SetProgress(port, 0); progress = 0; }
-            var cand = chain[progress];
+        for (var port = 0; port < branchNode.OutputCount; port++) {
+            var r = ResolvePort(flow, branchNode, bs, port);
+            if (r is not { } rr) continue;
 
             // oGCD ports are eligible only inside the weave window and when actually usable.
-            if (cand.IsOgcd) {
-                if (!WeaveWindowOpen(state))         continue;
-                if (!IsUsableForWeave(cand.ActionId)) continue;
+            if (ActionHelper.IsOgcd(rr.cand.ActionId)) {
+                if (!WeaveWindowOpen(state))            continue;
+                if (!IsUsableForWeave(rr.cand.ActionId)) continue;
             }
             // GCD ports win by priority alone — the game queues until the GCD is ready.
 
             bs.ActivePort           = port;
             state.CurrentBranchId   = branchNode.Id;
             state.CurrentBranchPort = port;
-            state.NextActionId      = cand.Id;
+            state.NextActionId      = rr.cand.Id;
             return;
         }
 
@@ -314,6 +397,34 @@ internal static class FlowExecutor {
         return chain;
     }
 
+    // Resolve an action id to its evolved/adjusted form (e.g. Edge of Darkness → Edge of Shadow).
+    private static unsafe uint Adjusted(uint actionId) {
+        var mgr = ActionManager.Instance();
+        return mgr != null ? mgr->GetAdjustedActionId(actionId) : actionId;
+    }
+
+    // Reset only the active chain back to its first step, leaving branch/condition/weave state intact.
+    private static void ResetActiveChain(ComboFlow flow, FlowNode trigger, FlowRunState state) {
+        if (state.CurrentBranchId != null
+            && state.BranchStates.TryGetValue(state.CurrentBranchId, out var bs)) {
+            var node = flow.Nodes.Find(n => n.Id == state.CurrentBranchId);
+            if (node != null) {
+                // Break inside a combo group → restart at the group's first node, not the chain head.
+                var chain   = GetActiveChain(flow, node, state.CurrentBranchPort);
+                var prog    = bs.GetProgress(state.CurrentBranchPort);
+                var resetTo = 0;
+                if (prog > 0 && prog < chain.Count && chain[prog].GroupId is { } gid) {
+                    resetTo = prog;
+                    while (resetTo > 0 && chain[resetTo - 1].GroupId == gid) resetTo--;
+                }
+                bs.SetProgress(state.CurrentBranchPort, resetTo);
+                ReResolve(flow, state, node);
+                return;
+            }
+        }
+        FindInitialAction(flow, trigger, state);                  // linear chain → chain head
+    }
+
     // True while a GCD is rolling, the weave budget isn't spent, and the window hasn't closed.
     private static bool WeaveWindowOpen(FlowRunState state) =>
         WeaveHelper.IsGcdRolling
@@ -336,7 +447,7 @@ internal static class FlowExecutor {
     private static unsafe bool IsUsableForWeave(uint actionId) {
         var mgr = ActionManager.Instance();
         if (mgr == null) return false;
-        var adj = mgr->GetAdjustedActionId(actionId);
+        var adj = Adjusted(actionId);
 
         if (mgr->GetActionStatus(ActionType.Action, adj) == 0)
             return true;
@@ -352,7 +463,7 @@ internal static class FlowExecutor {
 
     private static void TrackWeaveCount(ComboFlow flow, FlowRunState state) {
         var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
-        if (node?.IsOgcd == true) state.WeavedThisWindow++;
+        if (node != null && ActionHelper.IsOgcd(node.ActionId)) state.WeavedThisWindow++;
         else                      state.WeavedThisWindow = 0;
         state.LastTickSkipId = null;
     }
@@ -361,6 +472,8 @@ internal static class FlowExecutor {
         s.NextActionId       = "";
         s.CurrentBranchId    = null;
         s.ActiveBranchNodeId = null;
+        s.CommittedBranchId  = null;
+        s.CommittedPort      = -1;
         s.PendingFire        = false;
         s.FrozenReturn       = 0;
         s.LastPressedTick    = 0;

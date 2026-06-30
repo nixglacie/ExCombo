@@ -24,6 +24,10 @@ public class FlowNode {
     public int    ConditionCompareOp  { get; set; } = 5;  // CompareOp.Gte
     public float  ConditionCompareVal { get; set; } = 1f;
 
-    // True when CooldownGroup != 57 (not on the GCD recast track)
+    // Cached oGCD hint for the editor UI; the executor derives this live via ActionHelper.IsOgcd.
     public bool IsOgcd { get; set; } = false;
+
+    // Non-null id shared by nodes forming an atomic combo group (runs to completion before
+    // the branch re-evaluates priority). Null = ungrouped.
+    public string? GroupId { get; set; } = null;
 }
