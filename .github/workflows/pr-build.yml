@@ -1,8 +1,8 @@
-name: Sample PR Builder for SamplePlugin
+name: PR Builder for ExCombo
 
 on:
   pull_request:
-    branches: [ master ]
+    branches: [ main ]
 
 jobs:
 
@@ -10,7 +10,7 @@ jobs:
     runs-on: windows-2022
 
     env:
-      Solution_Name: SamplePlugin
+      Solution_Name: ExCombo
 
     steps:
     - name: Checkout
@@ -32,8 +32,7 @@ jobs:
     - name: Store artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: SamplePlugin
-        path: .\SamplePlugin\bin\x64\Release\SamplePlugin\*
+        name: ExCombo
+        path: .\ExCombo\bin\Release\ExCombo\*
         if-no-files-found: error
         retention-days: 1
-
