@@ -31,6 +31,7 @@ public class MainWindow : Window {
     // Status
     private string? _statusMsg;
     private float   _statusTimer;
+    private bool    _statusError;
 
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNameCaseInsensitive = true };
 
@@ -109,7 +110,7 @@ public class MainWindow : Window {
                 _configWindow.IsOpen = !_configWindow.IsOpen;
             ImGui.PopStyleColor(4);
             ImGui.PopStyleVar();
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Settings");
+            if (ImGui.IsItemHovered()) Tip("Settings");
         }
 
         if (_statusMsg != null) {
@@ -117,7 +118,16 @@ public class MainWindow : Window {
             if (_statusTimer <= 0f) { _statusMsg = null; }
             else {
                 ImGui.SameLine(0, 12f);
-                ImGui.TextColored(new Vector4(0.635f, 0.855f, 0.549f, Math.Min(1f, _statusTimer)), _statusMsg);
+                var sa = Math.Min(1f, _statusTimer);
+                if (_statusError) {
+                    ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
+                    ImGui.TextColored(new Vector4(1f, 0.6f, 0.1f, sa), FontAwesomeIcon.ExclamationTriangle.ToIconString());
+                    ImGui.PopFont();
+                    ImGui.SameLine(0, 6f);
+                }
+                var sc = _statusError ? new Vector4(1f, 0.45f, 0.45f, sa)
+                                      : new Vector4(0.635f, 0.855f, 0.549f, sa);
+                ImGui.TextColored(sc, _statusMsg);
             }
         }
 
@@ -214,7 +224,16 @@ public class MainWindow : Window {
                 // ── Enable toggle ──────────────────────────────────────────
                 ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 3f);
                 var enabled = flow.Enabled;
-                if (ImGui.Checkbox($"##en_{flow.Id}", ref enabled)) { flow.Enabled = enabled; _config.Save(); }
+                if (ImGui.Checkbox($"##en_{flow.Id}", ref enabled)) {
+                    if (enabled) {
+                        var c = FindTriggerConflict(flow);
+                        if (c is { } hit)
+                            SetStatus($"Can't enable \"{flow.Name}\": trigger {hit.label} is already used by active flow \"{hit.other.Name}\" — disable it first.", error: true);
+                        else { flow.Enabled = true; _config.Save(); }
+                    } else {
+                        flow.Enabled = false; _config.Save();
+                    }
+                }
                 ImGui.PopStyleVar();
                 ImGui.SameLine(0, 6f);
 
@@ -229,10 +248,8 @@ public class MainWindow : Window {
                 }
 
                 // ── Name / rename ──────────────────────────────────────────
-                var textSz = ImGui.CalcTextSize(flow.Name);
-                ImGui.SetCursorScreenPos(new Vector2(ImGui.GetCursorScreenPos().X, midY - textSz.Y / 2f));
-
                 if (_renamingId == flow.Id) {
+                    ImGui.SetCursorScreenPos(new Vector2(ImGui.GetCursorScreenPos().X, midY - ImGui.GetFrameHeight() / 2f));
                     ImGui.SetNextItemWidth(160f);
                     if (ImGui.InputText("##rename", ref _pendingRename, 64, ImGuiInputTextFlags.EnterReturnsTrue))
                         CommitRename(flow);
@@ -240,18 +257,34 @@ public class MainWindow : Window {
                     ImGui.SameLine(0, 4f);
                     if (ImGui.SmallButton("OK")) CommitRename(flow);
                 } else {
+                    var textSz  = ImGui.CalcTextSize(flow.Name);
+                    var namePos = new Vector2(ImGui.GetCursorScreenPos().X, midY - textSz.Y / 2f);
                     float nr = isActive ? 0.455f : 0.827f;
                     float ng = isActive ? 0.765f : 0.831f;
                     float nb = isActive ? 1.000f : 0.839f;
-                    ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(nr, ng, nb, 1f));
-                    ImGui.Text(flow.Name);
-                    ImGui.PopStyleColor();
+                    dl.AddText(namePos, ImGui.GetColorU32(new Vector4(nr, ng, nb, 1f)), flow.Name);
 
-                    if (ImGui.IsItemClicked() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
+                    ImGui.SetCursorScreenPos(namePos);
+                    ImGui.InvisibleButton($"##name_{flow.Id}", textSz);
+                    if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
                         _renamingId    = flow.Id;
                         _pendingRename = flow.Name;
                     }
 
+                    // ── Conflict warning (disabled flow blocked by an active one) ──
+                    if (!flow.Enabled && FindTriggerConflict(flow) is { } cf) {
+                        ImGui.SameLine(0, 8f);
+                        ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
+                        var icoStr = FontAwesomeIcon.ExclamationTriangle.ToIconString();
+                        var icoSz  = ImGui.CalcTextSize(icoStr);
+                        var icoPos = new Vector2(ImGui.GetCursorScreenPos().X, midY - icoSz.Y / 2f);
+                        dl.AddText(icoPos, ImGui.GetColorU32(new Vector4(1f, 0.6f, 0.1f, 1f)), icoStr);
+                        ImGui.PopFont();
+                        ImGui.SetCursorScreenPos(icoPos);
+                        ImGui.InvisibleButton($"##warn_{flow.Id}", icoSz);
+                        if (ImGui.IsItemHovered())
+                            Tip($"Conflicts with active flow \"{cf.other.Name}\" (trigger {cf.label}). Disable it to enable this one.");
+                    }
                 }
 
                 // ── Action buttons (right-aligned, icon-only) ──────────────
@@ -266,6 +299,25 @@ public class MainWindow : Window {
 
                 var icoSize = new Vector2(IcoSz, IcoSz);
 
+                // ── Trigger action icons (left of the edit button) ─────────
+                const float TrigSz  = 26f;
+                const float TrigGap = 4f;
+                var trigNodes = flow.Nodes.FindAll(n => n.Type == NodeType.Trigger && n.IconId != 0);
+                float trigTotalW = trigNodes.Count * TrigSz + Math.Max(0, trigNodes.Count - 1) * TrigGap;
+                float trigStartX = editX - 10f - trigTotalW;
+                float trigY      = midY - TrigSz / 2f - winPos.Y + scrollY;
+                for (var ti = 0; ti < trigNodes.Count; ti++) {
+                    var tw = GetIconWrap(trigNodes[ti].IconId);
+                    if (tw == null) continue;
+                    ImGui.SetCursorPos(new Vector2(trigStartX + ti * (TrigSz + TrigGap), trigY));
+                    var p0 = ImGui.GetCursorScreenPos();
+                    var p1 = p0 + new Vector2(TrigSz, TrigSz);
+                    dl.AddImageRounded(tw.Handle, p0, p1, Vector2.Zero, Vector2.One, 0xFFFFFFFFu, 5f);
+                    dl.AddRect(p0, p1, Col(0.333f, 0.353f, 0.388f, 0.8f), 5f, ImDrawFlags.None, 1f);
+                    ImGui.InvisibleButton($"##trig_{flow.Id}_{ti}", new Vector2(TrigSz, TrigSz));
+                    if (ImGui.IsItemHovered()) Tip(trigNodes[ti].ActionLabel);
+                }
+
                 // Edit (pen)
                 ImGui.SetCursorPos(new Vector2(editX, btnY));
                 ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.455f, 0.765f, 1f, 0.12f));
@@ -274,7 +326,7 @@ public class MainWindow : Window {
                 ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.455f, 0.765f, 1f, 0.85f));
                 if (ImGuiComponents.IconButton(FontAwesomeIcon.Pen, icoSize)) toEdit = flow.Id;
                 ImGui.PopStyleColor(4);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip("Edit");
+                if (ImGui.IsItemHovered()) Tip("Edit");
 
                 // Export (file-export)
                 ImGui.SetCursorPos(new Vector2(expX, btnY));
@@ -284,7 +336,7 @@ public class MainWindow : Window {
                 ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.565f, 0.573f, 0.588f, 1f));
                 if (ImGuiComponents.IconButton(FontAwesomeIcon.FileExport, icoSize)) ExportFlow(flow);
                 ImGui.PopStyleColor(4);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip("Export to clipboard");
+                if (ImGui.IsItemHovered()) Tip("Export to clipboard");
 
                 // Delete (trash)
                 ImGui.SetCursorPos(new Vector2(delX, btnY));
@@ -294,7 +346,7 @@ public class MainWindow : Window {
                 ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(1f, 0.522f, 0.569f, 0.80f));
                 if (ImGuiComponents.IconButton(FontAwesomeIcon.Trash, icoSize)) toDelete = flow.Id;
                 ImGui.PopStyleColor(4);
-                if (ImGui.IsItemHovered()) ImGui.SetTooltip("Delete");
+                if (ImGui.IsItemHovered()) Tip("Delete");
 
                 // Advance past row + gap (startCursorPos-based — fixes overlap)
                 ImGui.SetCursorPos(new Vector2(startCursorPos.X, startCursorPos.Y + rowH + RowGap));
@@ -416,7 +468,7 @@ public class MainWindow : Window {
                     wdl.AddRectFilled(pos - new Vector2(2f, 2f),
                                       pos + new Vector2(IconSz + 2f, IconSz + 2f),
                                       Col(0.455f, 0.765f, 1f, 0.10f), 5f);
-                    ImGui.SetTooltip(abbrev);
+                    Tip(abbrev);
                 }
 
                 // Selection border
@@ -454,7 +506,42 @@ public class MainWindow : Window {
         }
     }
 
-    private void SetStatus(string msg) { _statusMsg = msg; _statusTimer = 3f; }
+    // Tooltip with a visible border (the theme's PopupBorderSize is 0).
+    private static void Tip(string text) {
+        ImGui.PushStyleVar(ImGuiStyleVar.PopupBorderSize, 1f);
+        ImGui.PushStyleColor(ImGuiCol.Border, new Vector4(0.40f, 0.42f, 0.46f, 1f));
+        ImGui.SetTooltip(text);
+        ImGui.PopStyleColor();
+        ImGui.PopStyleVar();
+    }
+
+    private void SetStatus(string msg, bool error = false) {
+        _statusMsg   = msg;
+        _statusTimer = error ? 5f : 3f;
+        _statusError = error;
+    }
+
+    private static HashSet<uint> TriggerActionIds(ComboFlow flow) {
+        var s = new HashSet<uint>();
+        foreach (var n in flow.Nodes)
+            if (n.Type == NodeType.Trigger && n.ActionId != 0) s.Add(n.ActionId);
+        return s;
+    }
+
+    // First active same-job flow that shares a trigger with `flow`, plus the shared action's label.
+    private (ComboFlow other, string label)? FindTriggerConflict(ComboFlow flow) {
+        var mine = TriggerActionIds(flow);
+        if (mine.Count == 0) return null;
+        foreach (var other in _config.Flows) {
+            if (other.Id == flow.Id || !other.Enabled || other.Job != flow.Job) continue;
+            foreach (var n in other.Nodes) {
+                if (n.Type != NodeType.Trigger || n.ActionId == 0) continue;
+                if (mine.Contains(n.ActionId))
+                    return (other, n.ActionLabel.Length > 0 ? n.ActionLabel : n.ActionId.ToString());
+            }
+        }
+        return null;
+    }
 
     private static uint Col(float r, float g, float b, float a = 1f) =>
         ImGui.ColorConvertFloat4ToU32(new Vector4(r, g, b, a));

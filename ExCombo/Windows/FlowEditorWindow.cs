@@ -30,6 +30,7 @@ public class FlowEditorWindow : Window {
     private Vector2 _contextMenuCanvasPos;
     private string? _pendingDeleteNodeId;
     private string? _draggingNodeId;
+    private string? _draggingGroupId;
 
     private string? _condEditNodeId;
     private string  _condFieldSearch   = "";
@@ -57,7 +58,7 @@ public class FlowEditorWindow : Window {
     private const           float   GridStep    = 32f;
     private const           float   BranchSlotH = 32f;
 
-    private static bool IconMenuItem(FontAwesomeIcon icon, string label) {
+    private static bool IconMenuItem(FontAwesomeIcon icon, string label, uint? iconColor = null) {
         var dl = ImGui.GetWindowDrawList();
         ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
         var iconStr = icon.ToIconString();
@@ -70,7 +71,7 @@ public class FlowEditorWindow : Window {
             var rMin = ImGui.GetItemRectMin();
             var rMax = ImGui.GetItemRectMax();
             var sz   = ImGui.GetFontSize();
-            var col  = ImGui.GetColorU32(ImGuiCol.Text);
+            var col  = iconColor ?? ImGui.GetColorU32(ImGuiCol.Text);
             var ipos = new Vector2(rMin.X + 4f, rMin.Y + (rMax.Y - rMin.Y - sz) * 0.5f);
             ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
             dl.AddText(ipos, col, iconStr);
@@ -286,6 +287,26 @@ public class FlowEditorWindow : Window {
             dl.AddRectFilled(gMin, gMax, Col(1f, 0.7f, 0.2f, 0.08f), 8f);
             dl.AddRect(gMin, gMax, Col(1f, 0.7f, 0.2f, 0.7f), 8f, ImDrawFlags.None, 2f);
             dl.AddText(gMin + new Vector2(8f, 6f), Col(1f, 0.8f, 0.4f, 0.95f), "Combo");
+
+            // Header strip = drag handle: grab it to move the whole group.
+            ImGui.SetCursorScreenPos(gMin);
+            ImGui.InvisibleButton($"##grp_{gid}", new Vector2(gMax.X - gMin.X, GTop));
+            if (ImGui.IsItemHovered()) ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+            if (ImGui.IsItemActive() && ImGui.IsMouseDragging(ImGuiMouseButton.Left)) {
+                _draggingGroupId = gid;
+                var gd = ImGui.GetIO().MouseDelta;
+                foreach (var n in _flow.Nodes)
+                    if (n.GroupId == gid) { n.X += gd.X; n.Y += gd.Y; }
+            }
+            if (ImGui.IsItemDeactivated() && _draggingGroupId == gid) {
+                foreach (var n in _flow.Nodes)
+                    if (n.GroupId == gid) {
+                        n.X = MathF.Round(n.X / GridStep) * GridStep;
+                        n.Y = MathF.Round(n.Y / GridStep) * GridStep;
+                    }
+                _draggingGroupId = null;
+                _config.Save();
+            }
         }
 
         // ── Selection envelope (behind nodes) ─────────────────────────────
@@ -418,7 +439,7 @@ public class FlowEditorWindow : Window {
                 dl.AddRect(sp, sp + new Vector2(NodeSize.X, nodeH), borderCol, 6f, ImDrawFlags.None,
                     isSelected || nodeHovered ? 2f : 1.5f);
 
-                var label      = "Branch";
+                var label      = "Priority";
                 var labelWidth = ImGui.CalcTextSize(label).X;
                 var labelPos   = sp + new Vector2((NodeSize.X - labelWidth) * 0.5f, -16f);
                 DrawHelpers.DrawText(dl, labelPos, label, Col(0.70f, 0.40f, 1.00f), true);
@@ -585,24 +606,25 @@ public class FlowEditorWindow : Window {
             // ── Context menu ──────────────────────────────────────────────
             if (ImGui.BeginPopup($"node_ctx_{node.Id}")) {
                 if (isCondition) {
-                    if (IconMenuItem(FontAwesomeIcon.Filter, "Edit Job Condition")) OpenConditionEdit(node.Id);
+                    if (IconMenuItem(FontAwesomeIcon.Filter, "Edit Job Condition", Col(0.900f, 0.630f, 0.310f))) OpenConditionEdit(node.Id);
                 } else if (isBranch) {
-                    if (IconMenuItem(FontAwesomeIcon.List,   "Edit Outputs")) OpenBranchEdit(node.Id, node.OutputCount);
+                    if (IconMenuItem(FontAwesomeIcon.List,   "Edit Outputs", Col(0.700f, 0.400f, 1.000f))) OpenBranchEdit(node.Id, node.OutputCount);
                 } else {
-                    if (IconMenuItem(FontAwesomeIcon.Edit,   "Edit Action"))  OpenPicker(node.Id);
+                    if (IconMenuItem(FontAwesomeIcon.Edit,   "Edit Action",
+                            isTrigger ? Col(0.635f, 0.855f, 0.549f) : Col(0.455f, 0.765f, 1.000f))) OpenPicker(node.Id);
                 }
                 ImGui.Separator();
-                if (IconMenuItem(FontAwesomeIcon.Copy, "Copy")) {
+                if (IconMenuItem(FontAwesomeIcon.Copy, "Copy", Col(0.45f, 0.80f, 0.85f))) {
                     _clipboardNodes = [(node.Id, node.Type, 0f, 0f, node.ActionId, node.ActionLabel, node.IconId, node.OutputCount, node.ConditionField, node.ConditionCompareOp, (int)node.ConditionCompareVal, node.IsOgcd)];
                     _clipboardEdges = [];
                 }
-                if (IconMenuItem(FontAwesomeIcon.TrashAlt, "Delete Node"))  _pendingDeleteNodeId = node.Id;
-                if (IconMenuItem(FontAwesomeIcon.Unlink,   "Remove Links")) {
+                if (IconMenuItem(FontAwesomeIcon.TrashAlt, "Delete Node", Col(1f, 0.40f, 0.40f)))  _pendingDeleteNodeId = node.Id;
+                if (IconMenuItem(FontAwesomeIcon.Unlink,   "Remove Links", Col(0.95f, 0.60f, 0.30f))) {
                     _flow.Edges.RemoveAll(e => e.FromNodeId == node.Id || e.ToNodeId == node.Id);
                     FlowExecutor.InvalidateFlow(_flow.Id);
                     _config.Save();
                 }
-                if (node.GroupId != null && IconMenuItem(FontAwesomeIcon.ObjectUngroup, "Ungroup")) {
+                if (node.GroupId != null && IconMenuItem(FontAwesomeIcon.ObjectUngroup, "Ungroup", Col(1f, 0.70f, 0.20f))) {
                     node.GroupId = null;
                     FlowExecutor.InvalidateFlow(_flow.Id);
                     _config.Save();
@@ -614,7 +636,7 @@ public class FlowEditorWindow : Window {
         // ── Multi-selection context menu ──────────────────────────────────
         if (ImGui.BeginPopup("##multi_node_ctx")) {
             var selCount = _selectedNodeIds.Count;
-            if (IconMenuItem(FontAwesomeIcon.ObjectGroup, "Group as Combo")) {
+            if (IconMenuItem(FontAwesomeIcon.ObjectGroup, "Group as Combo", Col(1f, 0.70f, 0.20f))) {
                 var gid = Guid.NewGuid().ToString();
                 foreach (var n in _flow.Nodes)
                     if (_selectedNodeIds.Contains(n.Id) && n.Type == NodeType.Action) n.GroupId = gid;
@@ -622,7 +644,7 @@ public class FlowEditorWindow : Window {
                 _config.Save();
                 ImGui.CloseCurrentPopup();
             }
-            if (IconMenuItem(FontAwesomeIcon.ObjectUngroup, "Ungroup")) {
+            if (IconMenuItem(FontAwesomeIcon.ObjectUngroup, "Ungroup", Col(1f, 0.70f, 0.20f))) {
                 foreach (var n in _flow.Nodes)
                     if (_selectedNodeIds.Contains(n.Id)) n.GroupId = null;
                 FlowExecutor.InvalidateFlow(_flow.Id);
@@ -630,7 +652,7 @@ public class FlowEditorWindow : Window {
                 ImGui.CloseCurrentPopup();
             }
             ImGui.Separator();
-            if (IconMenuItem(FontAwesomeIcon.TrashAlt, $"Delete {selCount} nodes")) {
+            if (IconMenuItem(FontAwesomeIcon.TrashAlt, $"Delete {selCount} nodes", Col(1f, 0.40f, 0.40f))) {
                 foreach (var id in _selectedNodeIds) {
                     _flow.Edges.RemoveAll(e => e.FromNodeId == id || e.ToNodeId == id);
                     _flow.Nodes.RemoveAll(n => n.Id == id);
@@ -640,7 +662,7 @@ public class FlowEditorWindow : Window {
                 _config.Save();
                 ImGui.CloseCurrentPopup();
             }
-            if (IconMenuItem(FontAwesomeIcon.Copy, "Copy")) {
+            if (IconMenuItem(FontAwesomeIcon.Copy, "Copy", Col(0.45f, 0.80f, 0.85f))) {
                 var cx = 0f; var cy = 0f; var cnt = 0;
                 foreach (var n in _flow.Nodes) {
                     if (!_selectedNodeIds.Contains(n.Id)) continue;
@@ -721,13 +743,13 @@ public class FlowEditorWindow : Window {
             ImGui.OpenPopup("##canvas_ctx");
         }
         if (ImGui.BeginPopup("##canvas_ctx")) {
-            if (IconMenuItem(FontAwesomeIcon.Bolt,        "Add Trigger"))   AddNode(NodeType.Trigger);
-            if (IconMenuItem(FontAwesomeIcon.Magic,       "Add Action"))    AddNode(NodeType.Action);
-            if (IconMenuItem(FontAwesomeIcon.CodeBranch,  "Add Branch"))    AddNode(NodeType.Branch);
-            if (IconMenuItem(FontAwesomeIcon.Filter,      "Add Job Condition")) AddConditionNode();
+            if (IconMenuItem(FontAwesomeIcon.Bolt,        "Add Trigger",   Col(0.635f, 0.855f, 0.549f))) AddNode(NodeType.Trigger);
+            if (IconMenuItem(FontAwesomeIcon.Magic,       "Add Action",    Col(0.455f, 0.765f, 1.000f))) AddNode(NodeType.Action);
+            if (IconMenuItem(FontAwesomeIcon.CodeBranch,  "Add Priority",  Col(0.700f, 0.400f, 1.000f))) AddNode(NodeType.Branch);
+            if (IconMenuItem(FontAwesomeIcon.Filter,      "Add Job Condition", Col(0.900f, 0.630f, 0.310f))) AddConditionNode();
             if (_clipboardNodes != null) {
                 ImGui.Separator();
-                if (IconMenuItem(FontAwesomeIcon.Paste, $"Paste ({_clipboardNodes.Count} nodes)")) {
+                if (IconMenuItem(FontAwesomeIcon.Paste, $"Paste ({_clipboardNodes.Count} nodes)", Col(0.55f, 0.85f, 0.50f))) {
                     var pastePos = _contextMenuCanvasPos;
                     var idMap    = new Dictionary<string, string>();
                     var newNodes = new List<FlowNode>();
@@ -771,7 +793,7 @@ public class FlowEditorWindow : Window {
 
         // ── Deferred popup opens (must be outside all BeginPopup contexts) ──
         if (_pendingOpenPicker)     { ImGui.OpenPopup("Pick Action##picker");        _pendingOpenPicker     = false; }
-        if (_pendingOpenBranchEdit) { ImGui.OpenPopup("Branch Outputs##branchedit"); _pendingOpenBranchEdit = false; }
+        if (_pendingOpenBranchEdit) { ImGui.OpenPopup("Priority Outputs##branchedit"); _pendingOpenBranchEdit = false; }
         if (_pendingOpenCondEdit)   { ImGui.OpenPopup("Edit Condition##condedit");   _pendingOpenCondEdit   = false; }
 
         // ── Modals ────────────────────────────────────────────────────────
@@ -815,7 +837,7 @@ public class FlowEditorWindow : Window {
 
         ImGui.SetNextWindowSizeConstraints(new Vector2(260, 110), new Vector2(500, 200));
         ImGui.SetNextWindowSize(new Vector2(280, 120), ImGuiCond.FirstUseEver);
-        if (!ImGui.BeginPopupModal("Branch Outputs##branchedit", ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)) return;
+        if (!ImGui.BeginPopupModal("Priority Outputs##branchedit", ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)) return;
 
         ImGui.TextDisabled("Output count");
         ImGui.SameLine();

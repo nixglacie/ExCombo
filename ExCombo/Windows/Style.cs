@@ -5,7 +5,7 @@ namespace ExCombo.Windows;
 
 internal static class Style {
     internal const int ColorCount = 28;
-    internal const int VarCount   = 8;
+    internal const int VarCount   = 9;
 
     internal static void Push() {
         var v4bg1      = new Vector4(0.102f, 0.106f, 0.118f, 1f);
@@ -57,6 +57,7 @@ internal static class Style {
         ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding,     new Vector2(14f, 12f));
         ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding,     5f);
         ImGui.PushStyleVar(ImGuiStyleVar.PopupRounding,     8f);
+        ImGui.PushStyleVar(ImGuiStyleVar.PopupBorderSize,   1f);
         ImGui.PushStyleVar(ImGuiStyleVar.ChildRounding,     5f);
         ImGui.PushStyleVar(ImGuiStyleVar.GrabRounding,      4f);
         ImGui.PushStyleVar(ImGuiStyleVar.ScrollbarRounding, 5f);
