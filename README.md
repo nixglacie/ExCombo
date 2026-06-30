@@ -13,7 +13,7 @@ Dalamud installed, with the game run under Dalamud at least once.
 1. In-game, run `/xlsettings` → **Experimental** → **Custom Plugin Repositories**.
 2. Paste this URL, click **+**, then **Save**:
    ```
-   https://raw.githubusercontent.com/Exora/ExCombo/main/pluginmaster.json
+   https://raw.githubusercontent.com/nixglacie/ExCombo/main/pluginmaster.json
    ```
 3. Run `/xlplugins`, search **ExCombo**, and click **Install**.
 4. Run `/excombo` to open the editor.

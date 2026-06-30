@@ -9,10 +9,10 @@
     "ApplicableVersion": "any",
     "DalamudApiLevel": 15,
     "Tags": ["combat", "rotation", "combo", "nodes", "flow"],
-    "RepoUrl": "https://github.com/Exora/ExCombo",
-    "IconUrl": "https://raw.githubusercontent.com/Exora/ExCombo/main/ExCombo/icon.png",
-    "DownloadLinkInstall": "https://github.com/Exora/ExCombo/releases/latest/download/latest.zip",
-    "DownloadLinkUpdate": "https://github.com/Exora/ExCombo/releases/latest/download/latest.zip",
-    "DownloadLinkTesting": "https://github.com/Exora/ExCombo/releases/latest/download/latest.zip"
+    "RepoUrl": "https://github.com/nixglacie/ExCombo",
+    "IconUrl": "https://raw.githubusercontent.com/nixglacie/ExCombo/main/ExCombo/icon.png",
+    "DownloadLinkInstall": "https://github.com/nixglacie/ExCombo/releases/latest/download/latest.zip",
+    "DownloadLinkUpdate": "https://github.com/nixglacie/ExCombo/releases/latest/download/latest.zip",
+    "DownloadLinkTesting": "https://github.com/nixglacie/ExCombo/releases/latest/download/latest.zip"
   }
 ]
