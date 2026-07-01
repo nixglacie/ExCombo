@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Dalamud.Game.ClientState.Conditions;
 using ExCombo.Flow;
 using ExCombo.Helpers;
 using FFXIVClientStructs.FFXIV.Client.Game;
@@ -51,6 +52,11 @@ internal static class FlowExecutor {
         var cfg = Plugin.Config;
         if (cfg == null) return false;
         if (!cfg.Enabled) return true;
+        // Not safely in-world (login/logout, loading screens, zoning): the player and action data
+        // are transitional, so evaluating flows here can dereference unloaded game memory and hard-
+        // crash. Never touch anything until a local player exists and we're not between areas.
+        if (Plugin.ObjectTable.LocalPlayer == null) return true;
+        if (Plugin.Condition[ConditionFlag.BetweenAreas] || Plugin.Condition[ConditionFlag.BetweenAreas51]) return true;
         if (cfg.DisableInPvP && Plugin.ClientState.IsPvP) return true;
         if (cfg.PauseWhenOccupied && Helpers.PlayerStateHelper.IsOccupied()) return true;
         if (cfg.ReplaceOnlyInCombat && !Helpers.PlayerStateHelper.InCombat()) return true;

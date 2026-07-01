@@ -770,8 +770,9 @@ public class FlowEditorWindow : Window {
             var isGate      = FlowNode.IsGate(node.Type);
             var isJobCond   = node.Type == NodeType.Condition;
             var isNote      = node.Type == NodeType.Note;
-            // Live flow inspector: draw per-type state rings whenever the toggle is on.
-            var inspect     = _config.ShowConditionState;
+            // Live flow inspector: draw per-type state rings whenever the toggle is on and a local
+            // player exists (evaluating conditions during login/zoning can crash on unloaded memory).
+            var inspect     = _config.ShowConditionState && Plugin.ObjectTable.LocalPlayer != null;
             var nodeH       = NodeHeight(node);
             var nodeW       = NodeWidthOf(node);
             var sp          = canvasMin + _canvasOffset + new Vector2(node.X, node.Y);
