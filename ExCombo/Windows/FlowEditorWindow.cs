@@ -19,8 +19,14 @@ public class FlowEditorWindow : Window {
     public string? ActiveFlowId => _flow?.Id;
 
     private Vector2 _canvasOffset = Vector2.Zero;
-    private string? _wireFromNodeId;
+    private string? _wireFromNodeId;      // Mode A: source fixed, dragging to pick a target input
     private int     _wireFromPortIndex;
+    private string? _wireToNodeId;        // Mode B: target fixed, dragging to pick a source output
+
+    // Wire dropped on empty canvas → add-node menu open; the created node auto-connects.
+    private string? _dropSrcNodeId;       // dangling source (connect new node as its target)
+    private int     _dropSrcPort;
+    private string? _dropDstNodeId;       // dangling target (connect new node as its source)
     private string? _pickerNodeId;
     private string  _pickerSearch     = "";
     private string  _pickerLastSearch = "\0";
@@ -195,6 +201,24 @@ public class FlowEditorWindow : Window {
     private const float CondW    = 360f;   // content width for the content-sized condition modal
     private static float NodeWidthOf(FlowNode n) => n.Type == NodeType.Note ? n.NoteW : NodeSize.X;
 
+    // Screen position of a node's output port (branch/gate have OutputCount ports; others have one).
+    private Vector2 OutputPortPos(FlowNode n, int port, Vector2 canvasMin) =>
+        n.Type == NodeType.Branch || FlowNode.IsGate(n.Type)
+            ? canvasMin + _canvasOffset + new Vector2(n.X + NodeSize.X, (port + 0.5f) * BranchSlotH + n.Y)
+            : canvasMin + _canvasOffset + new Vector2(n.X + NodeSize.X, n.Y + NodeSize.Y * 0.5f);
+
+    // The output port under a screen point, if any (Notes have no output).
+    private (string NodeId, int Port)? FindOutputPortAt(Vector2 pt, Vector2 canvasMin) {
+        foreach (var n in _flow!.Nodes) {
+            if (n.Type == NodeType.Note) continue;
+            var ports = n.Type == NodeType.Branch || FlowNode.IsGate(n.Type) ? n.OutputCount : 1;
+            for (var p = 0; p < ports; p++)
+                if (Vector2.Distance(pt, OutputPortPos(n, p, canvasMin)) < PortRadius * 3f)
+                    return (n.Id, p);
+        }
+        return null;
+    }
+
     private static uint Col(float r, float g, float b, float a = 1f) =>
         ImGui.ColorConvertFloat4ToU32(new Vector4(r, g, b, a));
     private static uint Bg1 => Col(0.102f, 0.106f, 0.118f);
@@ -204,6 +228,8 @@ public class FlowEditorWindow : Window {
             MinimumSize = new Vector2(400, 300),
             MaximumSize = new Vector2(9999, 9999),
         };
+        // Panning places node hit-boxes off-canvas; without this the window grows scrollable space.
+        Flags = ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse;
         _config = config;
     }
 
@@ -219,11 +245,22 @@ public class FlowEditorWindow : Window {
         WindowName    = $"Flow Editor — {flow.Name}###ExComboEditor";
     }
 
-    public override void PreDraw()  => Style.Push();
-    public override void PostDraw() => Style.Pop();
+    public override void PreDraw() {
+        Style.Push();
+        // Canvas fills the window (nodes draw on the draw list) — no window padding needed.
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, Vector2.Zero);
+    }
+    public override void PostDraw() {
+        ImGui.PopStyleVar();
+        Style.Pop();
+    }
 
     public override void Draw() {
         if (_flow == null) { ImGui.TextDisabled("No flow selected."); return; }
+
+        // Off-canvas node hit-boxes can push scroll; pin it so panning never scrolls the window.
+        if (ImGui.GetScrollX() != 0f) ImGui.SetScrollX(0f);
+        if (ImGui.GetScrollY() != 0f) ImGui.SetScrollY(0f);
 
         var dl         = ImGui.GetWindowDrawList();
         var canvasMin  = ImGui.GetCursorScreenPos();
@@ -274,12 +311,26 @@ public class FlowEditorWindow : Window {
             var mid     = 0.125f*p1 + 0.375f*cp1 + 0.375f*cp2 + 0.125f*p4;
             const float Br = 7f;
             const float Bx = 3.5f;
-            var btnHovered = _wireFromNodeId == null && Vector2.Distance(mouse2, mid) < Br;
+            var btnHovered = _wireFromNodeId == null && _wireToNodeId == null && Vector2.Distance(mouse2, mid) < Br;
             dl.AddCircleFilled(mid, Br, btnHovered ? Col(0.75f, 0.15f, 0.15f) : Col(0.18f, 0.18f, 0.22f));
             dl.AddCircle(mid, Br, btnHovered ? Col(1f, 0.4f, 0.4f) : Col(0.45f, 0.35f, 0.35f), 12, 1.5f);
             dl.AddLine(mid + new Vector2(-Bx, -Bx), mid + new Vector2(Bx, Bx), Col(1f, 1f, 1f, 0.9f), 1.5f);
             dl.AddLine(mid + new Vector2(Bx, -Bx), mid + new Vector2(-Bx, Bx), Col(1f, 1f, 1f, 0.9f), 1.5f);
             if (btnHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) edgeToDelete = edge;
+
+            // ── Re-wire: grab an endpoint to detach and drag it elsewhere ─────
+            if (_wireFromNodeId == null && _wireToNodeId == null && !btnHovered) {
+                var grabEnd   = Vector2.Distance(mouse2, p4) < PortRadius * 2.5f;   // target/input end
+                var grabStart = Vector2.Distance(mouse2, p1) < PortRadius * 2.5f;   // source/output end
+                if (grabEnd || grabStart) {
+                    ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+                    if (ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
+                        edgeToDelete = edge;                       // detach the edge
+                        if (grabEnd) { _wireFromNodeId = edge.FromNodeId; _wireFromPortIndex = edge.FromPortIndex; }
+                        else         { _wireToNodeId   = edge.ToNodeId; }
+                    }
+                }
+            }
         }
         if (edgeToDelete != null) {
             _flow.Edges.Remove(edgeToDelete);
@@ -313,6 +364,7 @@ public class FlowEditorWindow : Window {
             }
 
             if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) {
+                var connected = false;
                 foreach (var t in _flow.Nodes) {
                     if (t.Id == _wireFromNodeId) continue;
                     if (t.Type == NodeType.Trigger) continue;
@@ -332,10 +384,51 @@ public class FlowEditorWindow : Window {
                             FlowExecutor.InvalidateFlow(_flow.Id);
                             _config.Save();
                         }
+                        connected = true;
                         break;
                     }
                 }
+                // Dropped on empty space → offer the add-node menu; the new node wires as the target.
+                if (!connected) {
+                    _dropSrcNodeId        = _wireFromNodeId;
+                    _dropSrcPort          = _wireFromPortIndex;
+                    _contextMenuCanvasPos = wireMouse - canvasMin - _canvasOffset;
+                    ImGui.OpenPopup("##canvas_ctx");
+                }
                 _wireFromNodeId = null;
+            }
+        }
+
+        // ── Pending wire (Mode B: target fixed, pick a source output) ─────
+        if (_wireToNodeId != null) {
+            var ttn = _flow.Nodes.Find(n => n.Id == _wireToNodeId);
+            if (ttn == null) {
+                _wireToNodeId = null;
+            } else {
+                var p4b   = canvasMin + _canvasOffset + new Vector2(ttn.X, ttn.Y + NodeHeight(ttn) * 0.5f);
+                var hit   = FindOutputPortAt(mouse2, canvasMin);
+                var start = hit is { } h && h.NodeId != _wireToNodeId
+                    ? OutputPortPos(_flow.Nodes.Find(n => n.Id == h.NodeId)!, h.Port, canvasMin)
+                    : mouse2;
+                dl.AddBezierCubic(start, start + new Vector2(60, 0), p4b - new Vector2(60, 0), p4b,
+                    Col(0.4f, 0.6f, 1f, 0.5f), 2f);
+
+                if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) {
+                    if (hit is { } hh && hh.NodeId != _wireToNodeId) {
+                        if (!_flow.Edges.Exists(e => e.FromNodeId == hh.NodeId && e.FromPortIndex == hh.Port && e.ToNodeId == _wireToNodeId)) {
+                            _flow.Edges.RemoveAll(e => e.FromNodeId == hh.NodeId && e.FromPortIndex == hh.Port);
+                            _flow.Edges.Add(new FlowEdge { FromNodeId = hh.NodeId, ToNodeId = _wireToNodeId, FromPortIndex = hh.Port });
+                            FlowExecutor.InvalidateFlow(_flow.Id);
+                            _config.Save();
+                        }
+                    } else {
+                        // Dropped on empty space → add-node menu; the new node wires as the source.
+                        _dropDstNodeId        = _wireToNodeId;
+                        _contextMenuCanvasPos = mouse2 - canvasMin - _canvasOffset;
+                        ImGui.OpenPopup("##canvas_ctx");
+                    }
+                    _wireToNodeId = null;
+                }
             }
         }
 
@@ -430,6 +523,11 @@ public class FlowEditorWindow : Window {
             var sp          = canvasMin + _canvasOffset + new Vector2(node.X, node.Y);
             var inPort      = sp + new Vector2(0f, nodeH * 0.5f);
 
+            // Input port is grabbable to start a wire the other way (input → output, Mode B).
+            var overInStart = !isTrigger && !isNote
+                && _wireFromNodeId == null && _wireToNodeId == null
+                && Vector2.Distance(mouse2, inPort) < PortRadius * 2f;
+
             // ── Output port hover detection ───────────────────────────────
             bool overOutPort    = false;
             int  overOutPortIdx = 0;
@@ -439,7 +537,7 @@ public class FlowEditorWindow : Window {
                 if (_wireFromNodeId == null)
                     overNoteResize = Vector2.Distance(mouse2, sp + new Vector2(nodeW, nodeH)) < 12f;
             } else if (isBranch || isGate) {
-                if (_wireFromNodeId == null) {
+                if (_wireFromNodeId == null && _wireToNodeId == null) {
                     for (var p = 0; p < node.OutputCount; p++) {
                         var portPos = sp + new Vector2(NodeSize.X, (p + 0.5f) * BranchSlotH);
                         if (Vector2.Distance(mouse2, portPos) < PortRadius * 2f) {
@@ -451,7 +549,7 @@ public class FlowEditorWindow : Window {
                 }
             } else {
                 var outPort = sp + new Vector2(NodeSize.X, NodeSize.Y * 0.5f);
-                overOutPort = _wireFromNodeId == null && Vector2.Distance(mouse2, outPort) < PortRadius * 2f;
+                overOutPort = _wireFromNodeId == null && _wireToNodeId == null && Vector2.Distance(mouse2, outPort) < PortRadius * 2f;
             }
 
             ImGui.SetCursorScreenPos(sp);
@@ -460,7 +558,7 @@ public class FlowEditorWindow : Window {
             var nodeActive  = ImGui.IsItemActive();
 
             // ── Select on click ───────────────────────────────────────────
-            if (nodeHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left) && !overOutPort) {
+            if (nodeHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Left) && !overOutPort && !overInStart) {
                 var xBtn = sp + new Vector2(NodeSize.X - 7f, 7f);
                 if (Vector2.Distance(mouse2, xBtn) >= 7f) {
                     if (ImGui.GetIO().KeyCtrl)
@@ -489,7 +587,7 @@ public class FlowEditorWindow : Window {
 
             // ── Drag ──────────────────────────────────────────────────────
             if (nodeActive && ImGui.IsMouseDragging(ImGuiMouseButton.Left)
-                && _wireFromNodeId != node.Id && _resizingNoteId != node.Id && !overNoteResize) {
+                && _wireFromNodeId == null && _wireToNodeId == null && _resizingNoteId != node.Id && !overNoteResize) {
                 _draggingNodeId = node.Id;
                 var delta = ImGui.GetIO().MouseDelta;
                 if (_selectedNodeIds.Contains(node.Id)) {
@@ -523,6 +621,9 @@ public class FlowEditorWindow : Window {
                 _wireFromNodeId    = node.Id;
                 _wireFromPortIndex = (isBranch || isGate) ? overOutPortIdx : 0;
             }
+            // Input → output: grab an input port to pick a source (Mode B); same node is blocked.
+            if (overInStart && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+                _wireToNodeId = node.Id;
 
             if (nodeHovered && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
                 if (isBranch)    OpenBranchEdit(node.Id, node.OutputCount);
@@ -600,15 +701,17 @@ public class FlowEditorWindow : Window {
                 DrawHelpers.DrawText(dl, labelPos, label, Col(0.70f, 0.40f, 1.00f), true);
 
                 // Input port (left midpoint)
-                var overInPort = _wireFromNodeId != null && _wireFromNodeId != node.Id
-                    && Vector2.Distance(mouse2, inPort) < PortRadius * 3f;
-                dl.AddCircleFilled(inPort, PortRadius, overInPort ? Col(0.3f, 0.9f, 0.3f) : Col(0.25f, 0.25f, 0.35f));
-                dl.AddCircle(inPort, PortRadius, overInPort ? Col(0.4f, 1f, 0.4f) : Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
+                var overInPort = overInStart || (_wireFromNodeId != null && _wireFromNodeId != node.Id
+                    && Vector2.Distance(mouse2, inPort) < PortRadius * 3f);
+                dl.AddCircleFilled(inPort, PortRadius, overInPort ? Col(0.35f, 0.65f, 1f) : Col(0.25f, 0.25f, 0.35f));
+                dl.AddCircle(inPort, PortRadius, overInPort ? Col(0.55f, 0.80f, 1f) : Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
 
                 // Output ports
                 for (var p = 0; p < node.OutputCount; p++) {
                     var portPos     = sp + new Vector2(NodeSize.X, (p + 0.5f) * BranchSlotH);
-                    var portHovered = overOutPort && overOutPortIdx == p;
+                    var portHovered = (overOutPort && overOutPortIdx == p)
+                        || (_wireToNodeId != null && node.Id != _wireToNodeId
+                            && Vector2.Distance(mouse2, portPos) < PortRadius * 3f);   // Mode B source hover
                     dl.AddCircleFilled(portPos, PortRadius,
                         portHovered ? Col(0.6f, 0.8f, 1f) : Col(0.25f, 0.25f, 0.35f));
                     dl.AddCircle(portPos, PortRadius, Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
@@ -697,19 +800,21 @@ public class FlowEditorWindow : Window {
                 DrawHelpers.DrawText(dl, condLabelPos, condLabel, condAccent, true);
 
                 // Input port
-                var overInPort = _wireFromNodeId != null && _wireFromNodeId != node.Id
-                    && Vector2.Distance(mouse2, inPort) < PortRadius * 3f;
-                dl.AddCircleFilled(inPort, PortRadius, overInPort ? Col(0.3f, 0.9f, 0.3f) : Col(0.25f, 0.25f, 0.35f));
-                dl.AddCircle(inPort, PortRadius, overInPort ? Col(0.4f, 1f, 0.4f) : Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
+                var overInPort = overInStart || (_wireFromNodeId != null && _wireFromNodeId != node.Id
+                    && Vector2.Distance(mouse2, inPort) < PortRadius * 3f);
+                dl.AddCircleFilled(inPort, PortRadius, overInPort ? Col(0.35f, 0.65f, 1f) : Col(0.25f, 0.25f, 0.35f));
+                dl.AddCircle(inPort, PortRadius, overInPort ? Col(0.55f, 0.80f, 1f) : Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
 
                 // Output ports: port 0 = true (green), port 1 = false (red)
                 for (var p = 0; p < node.OutputCount; p++) {
                     var portPos     = sp + new Vector2(NodeSize.X, (p + 0.5f) * BranchSlotH);
-                    var portHovered = overOutPort && overOutPortIdx == p;
+                    var portHovered = (overOutPort && overOutPortIdx == p)
+                        || (_wireToNodeId != null && node.Id != _wireToNodeId
+                            && Vector2.Distance(mouse2, portPos) < PortRadius * 3f);   // Mode B source hover
                     var ring = p == 0
                         ? (portHovered ? Col(0.45f, 1f, 0.45f) : Col(0.30f, 0.78f, 0.30f))
                         : (portHovered ? Col(1f, 0.45f, 0.45f) : Col(0.80f, 0.28f, 0.28f));
-                    dl.AddCircleFilled(portPos, PortRadius, Col(0.25f, 0.25f, 0.35f));
+                    dl.AddCircleFilled(portPos, PortRadius, portHovered ? Col(0.35f, 0.65f, 1f) : Col(0.25f, 0.25f, 0.35f));
                     dl.AddCircle(portPos, PortRadius, ring, 12, 1.5f);
                 }
 
@@ -811,12 +916,14 @@ public class FlowEditorWindow : Window {
 
                 // Ports
                 if (!isTrigger) {
-                    var overInPort = _wireFromNodeId != null && _wireFromNodeId != node.Id
-                        && Vector2.Distance(mouse2, inPort) < PortRadius * 3f;
-                    dl.AddCircleFilled(inPort, PortRadius, overInPort ? Col(0.3f, 0.9f, 0.3f) : Col(0.25f, 0.25f, 0.35f));
-                    dl.AddCircle(inPort, PortRadius, overInPort ? Col(0.4f, 1f, 0.4f) : Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
+                    var overInPort = overInStart || (_wireFromNodeId != null && _wireFromNodeId != node.Id
+                        && Vector2.Distance(mouse2, inPort) < PortRadius * 3f);
+                    dl.AddCircleFilled(inPort, PortRadius, overInPort ? Col(0.35f, 0.65f, 1f) : Col(0.25f, 0.25f, 0.35f));
+                    dl.AddCircle(inPort, PortRadius, overInPort ? Col(0.55f, 0.80f, 1f) : Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
                 }
-                dl.AddCircleFilled(outPort, PortRadius, overOutPort ? Col(0.6f, 0.8f, 1f) : Col(0.25f, 0.25f, 0.35f));
+                var outHover = overOutPort || (_wireToNodeId != null && node.Id != _wireToNodeId
+                    && Vector2.Distance(mouse2, outPort) < PortRadius * 3f);   // Mode B source hover
+                dl.AddCircleFilled(outPort, PortRadius, outHover ? Col(0.35f, 0.65f, 1f) : Col(0.25f, 0.25f, 0.35f));
                 dl.AddCircle(outPort, PortRadius, Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
             }
 
@@ -951,7 +1058,7 @@ public class FlowEditorWindow : Window {
 
         // Marquee start
         if (canvasActive && ImGui.IsMouseDragging(ImGuiMouseButton.Left)
-            && !_isMarqueeSelecting && _wireFromNodeId == null) {
+            && !_isMarqueeSelecting && _wireFromNodeId == null && _wireToNodeId == null) {
             _isMarqueeSelecting = true;
             _marqueeStart = mouse2 - ImGui.GetMouseDragDelta(ImGuiMouseButton.Left);
         }
@@ -973,9 +1080,12 @@ public class FlowEditorWindow : Window {
 
         if (!anyNodeRightClicked && canvasHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
             _contextMenuCanvasPos = mouse2 - canvasMin - _canvasOffset;
+            _dropSrcNodeId = null; _dropDstNodeId = null;   // plain right-click: no dangling wire
             ImGui.OpenPopup("##canvas_ctx");
         }
-        if (ImGui.BeginPopup("##canvas_ctx")) {
+        var ctxOpen = ImGui.BeginPopup("##canvas_ctx");
+        if (!ctxOpen) { _dropSrcNodeId = null; _dropDstNodeId = null; }   // menu dismissed → drop the dangling wire
+        if (ctxOpen) {
             if (IconMenuItem(FontAwesomeIcon.Bolt,        "Add Trigger",   Col(0.635f, 0.855f, 0.549f))) AddNode(NodeType.Trigger);
             if (IconMenuItem(FontAwesomeIcon.Magic,       "Add Action",    Col(0.455f, 0.765f, 1.000f))) AddNode(NodeType.Action);
             if (IconMenuItem(FontAwesomeIcon.CodeBranch,  "Add Priority",  Col(0.700f, 0.400f, 1.000f))) AddNode(NodeType.Branch);
@@ -1051,6 +1161,7 @@ public class FlowEditorWindow : Window {
             Y    = MathF.Round((_contextMenuCanvasPos.Y - NodeSize.Y * 0.5f) / GridStep) * GridStep,
         };
         _flow!.Nodes.Add(node);
+        TryConnectDropped(node);
         _config.Save();
         if (type != NodeType.Branch && type != NodeType.Condition)
             OpenPicker(node.Id);
@@ -1064,8 +1175,29 @@ public class FlowEditorWindow : Window {
             Y           = MathF.Round((_contextMenuCanvasPos.Y - NodeSize.Y * 0.5f) / GridStep) * GridStep,
         };
         _flow!.Nodes.Add(node);
+        TryConnectDropped(node);
         _config.Save();
         OpenConditionEdit(node.Id);
+    }
+
+    // Wire a node just created from the drop-menu into the dangling connection, if any.
+    private void TryConnectDropped(FlowNode nn) {
+        if (_dropSrcNodeId != null) {
+            if (nn.Type != NodeType.Trigger && nn.Type != NodeType.Note) {
+                _flow!.Edges.RemoveAll(e => e.FromNodeId == _dropSrcNodeId && e.FromPortIndex == _dropSrcPort);
+                _flow.Edges.Add(new FlowEdge { FromNodeId = _dropSrcNodeId, ToNodeId = nn.Id, FromPortIndex = _dropSrcPort });
+                FlowExecutor.InvalidateFlow(_flow.Id);
+            }
+            _dropSrcNodeId = null;
+        }
+        if (_dropDstNodeId != null) {
+            if (nn.Type != NodeType.Note && nn.Id != _dropDstNodeId) {
+                _flow!.Edges.RemoveAll(e => e.FromNodeId == nn.Id && e.FromPortIndex == 0);
+                _flow.Edges.Add(new FlowEdge { FromNodeId = nn.Id, ToNodeId = _dropDstNodeId, FromPortIndex = 0 });
+                FlowExecutor.InvalidateFlow(_flow.Id);
+            }
+            _dropDstNodeId = null;
+        }
     }
 
     // Short category label used when a gate node has no check selected yet.
@@ -1096,6 +1228,7 @@ public class FlowEditorWindow : Window {
             Y    = MathF.Round((_contextMenuCanvasPos.Y - NodeSize.Y * 0.5f) / GridStep) * GridStep,
         };
         _flow!.Nodes.Add(node);
+        TryConnectDropped(node);
         _config.Save();
         OpenNoteEdit(node.Id);
     }
@@ -1495,6 +1628,7 @@ public class FlowEditorWindow : Window {
                     }
                     ImGui.SetCursorPos(new Vector2(rs.X + (icon != 0 ? 40f : 0f), rs.Y + (36f - ImGui.GetTextLineHeight()) * 0.5f));
                     ImGui.TextUnformatted(isStatus ? name : $"Lv{level}  {name}");
+                    ImGui.SetCursorPos(new Vector2(rs.X, rs.Y + 40f));   // pin row height (+4px gap) so rows don't overlap
                 }
                 ImGui.EndChild();
             } else if (def.Param is CheckParamKind.Range or CheckParamKind.Number) {
