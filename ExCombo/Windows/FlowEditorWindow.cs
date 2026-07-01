@@ -2,8 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using System.Text.Json;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
+using Dalamud.Interface.Components;
 using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Textures;
 using Dalamud.Interface.Windowing;
@@ -19,6 +21,13 @@ public class FlowEditorWindow : Window {
     public string? ActiveFlowId => _flow?.Id;
 
     private Vector2 _canvasOffset = Vector2.Zero;
+
+    // Undo/redo: JSON snapshots of the flow's graph. _lastSnapshot is the current committed state.
+    private static readonly JsonSerializerOptions UndoJson = new();
+    private readonly List<string> _undo = new();
+    private readonly List<string> _redo = new();
+    private string? _lastSnapshot;
+
     private string? _wireFromNodeId;      // Mode A: source fixed, dragging to pick a target input
     private int     _wireFromPortIndex;
     private string? _wireToNodeId;        // Mode B: target fixed, dragging to pick a source output
@@ -37,7 +46,10 @@ public class FlowEditorWindow : Window {
     private string? _branchEditNodeId;
     private int     _branchEditCount;
     private Vector2 _contextMenuCanvasPos;
-    private string? _pendingDeleteNodeId;
+    private string?       _pendingDeleteNodeId;
+    private string?       _confirmDeleteNodeId;    // awaiting single confirm-delete popup
+    private List<string>? _pendingDeleteMulti;     // multi-select delete requested (from context menu)
+    private List<string>? _confirmDeleteMulti;     // awaiting multi confirm-delete popup
     private string? _draggingNodeId;
     private string? _draggingGroupId;
 
@@ -90,8 +102,74 @@ public class FlowEditorWindow : Window {
 
     private static readonly Vector2 NodeSize    = new(64f, 64f);
     private const           float   PortRadius  = 6f;
-    private const           float   GridStep    = 32f;
+    private static          float   GridStep    => Plugin.Config?.GridSize ?? 32f;   // user-tunable
     private const           float   BranchSlotH = 32f;
+
+    // Snap a coordinate to the grid, honouring the SnapToGrid preference.
+    private static float Snap(float v) =>
+        (Plugin.Config?.SnapToGrid ?? true) ? MathF.Round(v / GridStep) * GridStep : v;
+
+    private void DeleteNode(string nodeId) {
+        if (_flow == null) return;
+        _selectedNodeIds.Remove(nodeId);
+        _flow.Edges.RemoveAll(e => e.FromNodeId == nodeId || e.ToNodeId == nodeId);
+        _flow.Nodes.RemoveAll(n => n.Id == nodeId);
+        FlowExecutor.InvalidateFlow(_flow.Id);
+        Commit();
+    }
+
+    private void DeleteSelected(List<string> ids) {
+        if (_flow == null || ids.Count == 0) return;
+        foreach (var id in ids) {
+            _flow.Edges.RemoveAll(e => e.FromNodeId == id || e.ToNodeId == id);
+            _flow.Nodes.RemoveAll(n => n.Id == id);
+        }
+        _selectedNodeIds.Clear();
+        FlowExecutor.InvalidateFlow(_flow.Id);
+        Commit();
+    }
+
+    private void DrawConfirmDeletePopup() {
+        var center = ImGui.GetMainViewport().GetCenter();
+        ImGui.SetNextWindowPos(center, ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+        if (!ImGui.BeginPopupModal("Delete node?##excDelNode",
+                ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoSavedSettings)) return;
+
+        ImGui.Text("Delete this node and its connections?");
+        ImGui.Spacing();
+        if (ImGui.Button("Delete", new Vector2(120f, 0f))) {
+            if (_confirmDeleteNodeId != null) DeleteNode(_confirmDeleteNodeId);
+            _confirmDeleteNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Cancel", new Vector2(120f, 0f))) {
+            _confirmDeleteNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.EndPopup();
+    }
+
+    private void DrawConfirmDeleteMultiPopup() {
+        var center = ImGui.GetMainViewport().GetCenter();
+        ImGui.SetNextWindowPos(center, ImGuiCond.Appearing, new Vector2(0.5f, 0.5f));
+        if (!ImGui.BeginPopupModal("Delete nodes?##excDelMulti",
+                ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoSavedSettings)) return;
+
+        ImGui.Text($"Delete {_confirmDeleteMulti?.Count ?? 0} nodes and their connections?");
+        ImGui.Spacing();
+        if (ImGui.Button("Delete", new Vector2(120f, 0f))) {
+            if (_confirmDeleteMulti != null) DeleteSelected(_confirmDeleteMulti);
+            _confirmDeleteMulti = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Cancel", new Vector2(120f, 0f))) {
+            _confirmDeleteMulti = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.EndPopup();
+    }
 
     private static bool IconMenuItem(FontAwesomeIcon icon, string label, uint? iconColor = null) {
         var dl = ImGui.GetWindowDrawList();
@@ -240,9 +318,82 @@ public class FlowEditorWindow : Window {
 
     public void SetFlow(ComboFlow flow) {
         _flow         = flow;
-        _canvasOffset = Vector2.Zero;
+        _canvasOffset = new Vector2(flow.ViewX, flow.ViewY);
         _selectedNodeIds.Clear();
+        _undo.Clear();
+        _redo.Clear();
+        _lastSnapshot = Snapshot(flow);
         WindowName    = $"Flow Editor — {flow.Name}###ExComboEditor";
+    }
+
+    // ── Undo / redo ──────────────────────────────────────────────────────
+
+    private static string Snapshot(ComboFlow f) => JsonSerializer.Serialize(f, UndoJson);
+
+    // Persist + record an undo point. Replaces every _config.Save() inside the editor: pushes the
+    // previously-committed state onto the undo stack, then re-baselines to the new current state.
+    private void Commit() {
+        if (_flow != null) {
+            if (_lastSnapshot != null) {
+                _undo.Add(_lastSnapshot);
+                var depth = Math.Max(1, Plugin.Config?.UndoDepth ?? 50);
+                while (_undo.Count > depth) _undo.RemoveAt(0);
+                _redo.Clear();
+            }
+            _lastSnapshot = Snapshot(_flow);
+        }
+        _config.Save();
+    }
+
+    // Floating Undo/Redo buttons in the canvas top-left corner. Greyed out when nothing to do.
+    private void DrawUndoToolbar(Vector2 canvasMin) {
+        var start = ImGui.GetCursorPos();
+        var icoSz = new Vector2(30f, 28f);
+
+        ImGui.SetCursorScreenPos(canvasMin + new Vector2(8f, 8f));
+        bool canUndo = _undo.Count > 0;
+        if (!canUndo) ImGui.BeginDisabled();
+        if (ImGuiComponents.IconButton(FontAwesomeIcon.Undo, icoSz)) Undo();
+        if (!canUndo) ImGui.EndDisabled();
+        if (canUndo && ImGui.IsItemHovered()) ImGui.SetTooltip($"Undo ({_undo.Count})");
+
+        ImGui.SetCursorScreenPos(canvasMin + new Vector2(8f + icoSz.X + 4f, 8f));
+        bool canRedo = _redo.Count > 0;
+        if (!canRedo) ImGui.BeginDisabled();
+        if (ImGuiComponents.IconButton(FontAwesomeIcon.Redo, icoSz)) Redo();
+        if (!canRedo) ImGui.EndDisabled();
+        if (canRedo && ImGui.IsItemHovered()) ImGui.SetTooltip($"Redo ({_redo.Count})");
+
+        ImGui.SetCursorPos(start);
+    }
+
+    private void Undo() {
+        if (_flow == null || _undo.Count == 0) return;
+        if (_lastSnapshot != null) _redo.Add(_lastSnapshot);
+        var snap = _undo[^1];
+        _undo.RemoveAt(_undo.Count - 1);
+        ApplySnapshot(snap);
+    }
+
+    private void Redo() {
+        if (_flow == null || _redo.Count == 0) return;
+        if (_lastSnapshot != null) _undo.Add(_lastSnapshot);
+        var snap = _redo[^1];
+        _redo.RemoveAt(_redo.Count - 1);
+        ApplySnapshot(snap);
+    }
+
+    // Restore graph state into the existing _flow instance (keeps references in _config.Flows valid).
+    private void ApplySnapshot(string snap) {
+        if (_flow == null) return;
+        var restored = JsonSerializer.Deserialize<ComboFlow>(snap, UndoJson);
+        if (restored == null) return;
+        _flow.Nodes = restored.Nodes;
+        _flow.Edges = restored.Edges;
+        _lastSnapshot = snap;
+        _selectedNodeIds.Clear();
+        FlowExecutor.InvalidateFlow(_flow.Id);
+        _config.Save();
     }
 
     public override void PreDraw() {
@@ -285,6 +436,12 @@ public class FlowEditorWindow : Window {
         // ── Middle-drag pan (always active) ──────────────────────────────
         if (ImGui.IsMouseDragging(ImGuiMouseButton.Middle))
             _canvasOffset += ImGui.GetIO().MouseDelta;
+        if (ImGui.IsMouseReleased(ImGuiMouseButton.Middle) && _flow is { } panFlow
+            && (panFlow.ViewX != _canvasOffset.X || panFlow.ViewY != _canvasOffset.Y)) {
+            panFlow.ViewX = _canvasOffset.X;   // persist view without an undo entry
+            panFlow.ViewY = _canvasOffset.Y;
+            _config.Save();
+        }
 
         var mouse2 = ImGui.GetMousePos();
 
@@ -339,7 +496,7 @@ public class FlowEditorWindow : Window {
         if (edgeToDelete != null) {
             _flow.Edges.Remove(edgeToDelete);
             FlowExecutor.InvalidateFlow(_flow.Id);
-            _config.Save();
+            Commit();
         }
 
         // ── Pending wire ──────────────────────────────────────────────────
@@ -386,7 +543,7 @@ public class FlowEditorWindow : Window {
                                 FromPortIndex = _wireFromPortIndex,
                             });
                             FlowExecutor.InvalidateFlow(_flow.Id);
-                            _config.Save();
+                            Commit();
                         }
                         connected = true;
                         break;
@@ -423,7 +580,7 @@ public class FlowEditorWindow : Window {
                             _flow.Edges.RemoveAll(e => e.FromNodeId == hh.NodeId && e.FromPortIndex == hh.Port);
                             _flow.Edges.Add(new FlowEdge { FromNodeId = hh.NodeId, ToNodeId = _wireToNodeId, FromPortIndex = hh.Port });
                             FlowExecutor.InvalidateFlow(_flow.Id);
-                            _config.Save();
+                            Commit();
                         }
                     } else {
                         // Dropped on empty space → add-node menu; the new node wires as the source.
@@ -443,7 +600,7 @@ public class FlowEditorWindow : Window {
         var prunedGroup = false;
         foreach (var n in _flow.Nodes)
             if (n.GroupId != null && groupCounts[n.GroupId] < 2) { n.GroupId = null; prunedGroup = true; }
-        if (prunedGroup) { FlowExecutor.InvalidateFlow(_flow.Id); _config.Save(); }
+        if (prunedGroup) { FlowExecutor.InvalidateFlow(_flow.Id); Commit(); }
 
         // ── Combo group boxes (behind everything) ─────────────────────────
         var groupIds = new HashSet<string>();
@@ -483,11 +640,11 @@ public class FlowEditorWindow : Window {
             if (ImGui.IsItemDeactivated() && _draggingGroupId == gid) {
                 foreach (var n in _flow.Nodes)
                     if (n.GroupId == gid) {
-                        n.X = MathF.Round(n.X / GridStep) * GridStep;
-                        n.Y = MathF.Round(n.Y / GridStep) * GridStep;
+                        n.X = Snap(n.X);
+                        n.Y = Snap(n.Y);
                     }
                 _draggingGroupId = null;
-                _config.Save();
+                Commit();
             }
         }
 
@@ -582,10 +739,10 @@ public class FlowEditorWindow : Window {
                     node.NoteH = MathF.Max(NoteMinH, node.NoteH + rd.Y);
                 }
                 if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) {
-                    node.NoteW = MathF.Max(NoteMinW, MathF.Round(node.NoteW / GridStep) * GridStep);
-                    node.NoteH = MathF.Max(NoteMinH, MathF.Round(node.NoteH / GridStep) * GridStep);
+                    node.NoteW = MathF.Max(NoteMinW, Snap(node.NoteW));
+                    node.NoteH = MathF.Max(NoteMinH, Snap(node.NoteH));
                     _resizingNoteId = null;
-                    _config.Save();
+                    Commit();
                 }
             }
 
@@ -608,16 +765,16 @@ public class FlowEditorWindow : Window {
                     foreach (var selId in _selectedNodeIds) {
                         var sn = _flow.Nodes.Find(n => n.Id == selId);
                         if (sn != null) {
-                            sn.X = MathF.Round(sn.X / GridStep) * GridStep;
-                            sn.Y = MathF.Round(sn.Y / GridStep) * GridStep;
+                            sn.X = Snap(sn.X);
+                            sn.Y = Snap(sn.Y);
                         }
                     }
                 } else {
-                    node.X = MathF.Round(node.X / GridStep) * GridStep;
-                    node.Y = MathF.Round(node.Y / GridStep) * GridStep;
+                    node.X = Snap(node.X);
+                    node.Y = Snap(node.Y);
                 }
                 _draggingNodeId = null;
-                _config.Save();
+                Commit();
             }
 
             // ── Wire start ────────────────────────────────────────────────
@@ -798,6 +955,14 @@ public class FlowEditorWindow : Window {
                 dl.AddRect(sp, sp + new Vector2(NodeSize.X, nodeH), borderCol, 6f, ImDrawFlags.None,
                     isSelected || nodeHovered ? 2f : 1.5f);
 
+                // Live condition inspector: tint an outer ring green/red by current eval, in combat only.
+                if (_config.ShowConditionState && _flow is { } inspFlow && Helpers.PlayerStateHelper.InCombat()) {
+                    bool pass = FlowExecutor.EvalGate(inspFlow, node);
+                    var tint  = pass ? Col(0.30f, 0.85f, 0.30f, 0.9f) : Col(0.85f, 0.30f, 0.30f, 0.9f);
+                    dl.AddRect(sp - new Vector2(3f, 3f), sp + new Vector2(NodeSize.X + 3f, nodeH + 3f),
+                        tint, 8f, ImDrawFlags.None, 2f);
+                }
+
                 var condLabel      = GateNodeLabel(node);
                 var condLabelWidth = ImGui.CalcTextSize(condLabel).X;
                 var condLabelPos   = sp + new Vector2((NodeSize.X - condLabelWidth) * 0.5f, -16f);
@@ -948,7 +1113,7 @@ public class FlowEditorWindow : Window {
                             if (ImGui.MenuItem(modes[m], "", node.RetargetMode == m)) {
                                 node.RetargetMode = m;
                                 FlowExecutor.InvalidateFlow(_flow.Id);
-                                _config.Save();
+                                Commit();
                             }
                         ImGui.EndMenu();
                     }
@@ -962,12 +1127,12 @@ public class FlowEditorWindow : Window {
                 if (IconMenuItem(FontAwesomeIcon.Unlink,   "Remove Links", Col(0.95f, 0.60f, 0.30f))) {
                     _flow.Edges.RemoveAll(e => e.FromNodeId == node.Id || e.ToNodeId == node.Id);
                     FlowExecutor.InvalidateFlow(_flow.Id);
-                    _config.Save();
+                    Commit();
                 }
                 if (node.GroupId != null && IconMenuItem(FontAwesomeIcon.ObjectUngroup, "Ungroup", Col(1f, 0.70f, 0.20f))) {
                     node.GroupId = null;
                     FlowExecutor.InvalidateFlow(_flow.Id);
-                    _config.Save();
+                    Commit();
                 }
                 ImGui.EndPopup();
             }
@@ -984,26 +1149,20 @@ public class FlowEditorWindow : Window {
                     foreach (var n in _flow.Nodes)
                         if (_selectedNodeIds.Contains(n.Id) && n.Type == NodeType.Action) n.GroupId = gid;
                     FlowExecutor.InvalidateFlow(_flow.Id);
-                    _config.Save();
+                    Commit();
                     ImGui.CloseCurrentPopup();
                 }
                 if (IconMenuItem(FontAwesomeIcon.ObjectUngroup, "Ungroup", Col(1f, 0.70f, 0.20f))) {
                     foreach (var n in _flow.Nodes)
                         if (_selectedNodeIds.Contains(n.Id)) n.GroupId = null;
                     FlowExecutor.InvalidateFlow(_flow.Id);
-                    _config.Save();
+                    Commit();
                     ImGui.CloseCurrentPopup();
                 }
                 ImGui.Separator();
             }
             if (IconMenuItem(FontAwesomeIcon.TrashAlt, $"Delete {selCount} nodes", Col(1f, 0.40f, 0.40f))) {
-                foreach (var id in _selectedNodeIds) {
-                    _flow.Edges.RemoveAll(e => e.FromNodeId == id || e.ToNodeId == id);
-                    _flow.Nodes.RemoveAll(n => n.Id == id);
-                }
-                _selectedNodeIds.Clear();
-                FlowExecutor.InvalidateFlow(_flow.Id);
-                _config.Save();
+                _pendingDeleteMulti = _selectedNodeIds.ToList();   // routed through the confirm choke
                 ImGui.CloseCurrentPopup();
             }
             if (IconMenuItem(FontAwesomeIcon.Copy, "Copy", Col(0.45f, 0.80f, 0.85f))) {
@@ -1040,13 +1199,28 @@ public class FlowEditorWindow : Window {
 
         // ── Pending deletes (outside node loop) ───────────────────────────
         if (_pendingDeleteNodeId != null) {
-            _selectedNodeIds.Remove(_pendingDeleteNodeId);
-            _flow.Edges.RemoveAll(e => e.FromNodeId == _pendingDeleteNodeId || e.ToNodeId == _pendingDeleteNodeId);
-            _flow.Nodes.RemoveAll(n => n.Id == _pendingDeleteNodeId);
-            FlowExecutor.InvalidateFlow(_flow.Id);
-            _config.Save();
+            if (_config.ConfirmNodeDelete) {
+                _confirmDeleteNodeId = _pendingDeleteNodeId;
+                ImGui.OpenPopup("Delete node?##excDelNode");
+            } else {
+                DeleteNode(_pendingDeleteNodeId);
+            }
             _pendingDeleteNodeId = null;
         }
+        if (_pendingDeleteMulti != null) {
+            if (_config.ConfirmNodeDelete) {
+                _confirmDeleteMulti = _pendingDeleteMulti;
+                ImGui.OpenPopup("Delete nodes?##excDelMulti");
+            } else {
+                DeleteSelected(_pendingDeleteMulti);
+            }
+            _pendingDeleteMulti = null;
+        }
+        DrawConfirmDeletePopup();
+        DrawConfirmDeleteMultiPopup();
+
+        // ── Undo/redo toolbar (before the canvas button so it wins HoveredId over it) ──
+        DrawUndoToolbar(canvasMin);
 
         // ── Canvas input (submitted after nodes so nodes win HoveredId) ───
         ImGui.SetCursorScreenPos(canvasMin);
@@ -1134,7 +1308,7 @@ public class FlowEditorWindow : Window {
                         _selectedNodeIds.Add(nn.Id);
                     }
                     FlowExecutor.InvalidateFlow(_flow.Id);
-                    _config.Save();
+                    Commit();
                 }
             }
             ImGui.EndPopup();
@@ -1168,7 +1342,7 @@ public class FlowEditorWindow : Window {
         };
         _flow!.Nodes.Add(node);
         TryConnectDropped(node);
-        _config.Save();
+        Commit();
         if (type != NodeType.Branch && type != NodeType.Condition)
             OpenPicker(node.Id);
     }
@@ -1182,7 +1356,7 @@ public class FlowEditorWindow : Window {
         };
         _flow!.Nodes.Add(node);
         TryConnectDropped(node);
-        _config.Save();
+        Commit();
         OpenConditionEdit(node.Id);
     }
 
@@ -1235,7 +1409,7 @@ public class FlowEditorWindow : Window {
         };
         _flow!.Nodes.Add(node);
         TryConnectDropped(node);
-        _config.Save();
+        Commit();
         OpenNoteEdit(node.Id);
     }
 
@@ -1256,14 +1430,14 @@ public class FlowEditorWindow : Window {
 
         var btnW = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
 
-        ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.92f, 0.92f, 0.94f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.98f, 0.98f, 1.00f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.82f, 0.82f, 0.85f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Button,        Style.AccentColor);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Style.AccentHover);
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.AccentActive);
         ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.102f, 0.106f, 0.118f, 1f));
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
         if (ImGui.Button("OK", new Vector2(btnW, 0f))) {
             var node = _flow!.Nodes.Find(n => n.Id == _noteEditNodeId);
-            if (node != null) { node.NoteText = _noteEditText; _config.Save(); }
+            if (node != null) { node.NoteText = _noteEditText; Commit(); }
             _noteEditNodeId = null;
             ImGui.CloseCurrentPopup();
         }
@@ -1305,9 +1479,9 @@ public class FlowEditorWindow : Window {
 
         var btnW = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
 
-        ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.455f, 0.765f, 1.000f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.592f, 0.831f, 1.000f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.350f, 0.650f, 0.900f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Button,        Style.AccentColor);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Style.AccentHover);
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.AccentActive);
         ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.102f, 0.106f, 0.118f, 1f));
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
         if (ImGui.Button("OK", new Vector2(btnW, 0f))) {
@@ -1317,7 +1491,7 @@ public class FlowEditorWindow : Window {
                     _flow.Edges.RemoveAll(e => e.FromNodeId == node.Id && e.FromPortIndex == p);
                 node.OutputCount = _branchEditCount;
                 FlowExecutor.InvalidateFlow(_flow.Id);
-                _config.Save();
+                Commit();
             }
             _branchEditNodeId = null;
             ImGui.CloseCurrentPopup();
@@ -1393,7 +1567,7 @@ public class FlowEditorWindow : Window {
                         node.IconId      = icon;
                         node.IsOgcd      = ActionHelper.IsOgcd(id);
                         FlowExecutor.InvalidateFlow(_flow.Id);
-                        _config.Save();
+                        Commit();
                     }
                     _pickerNodeId = null;
                     ImGui.CloseCurrentPopup();
@@ -1412,9 +1586,9 @@ public class FlowEditorWindow : Window {
     }
 
     private static void DrawTabButton(string label, bool active, Action onClick) {
-        var accent    = new Vector4(0.455f, 0.765f, 1.000f, 1f);
-        var accentHov = new Vector4(0.592f, 0.831f, 1.000f, 1f);
-        var accentAct = new Vector4(0.350f, 0.650f, 0.900f, 1f);
+        var accent    = Style.AccentColor;
+        var accentHov = Style.AccentHover;
+        var accentAct = Style.AccentActive;
         var bg3       = new Vector4(0.173f, 0.180f, 0.200f, 1f);
         var bg3Hov    = new Vector4(0.216f, 0.224f, 0.247f, 1f);
         var textDark  = new Vector4(0.102f, 0.106f, 0.118f, 1f);
@@ -1691,17 +1865,17 @@ public class FlowEditorWindow : Window {
 
     private void DrawCondButtons(Action<FlowNode> apply) {
         var btnW = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
-        ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.90f, 0.63f, 0.31f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(1.00f, 0.75f, 0.45f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.75f, 0.50f, 0.20f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.10f, 0.06f, 0.02f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Button,        Style.AccentColor);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Style.AccentHover);
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.AccentActive);
+        ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.102f, 0.106f, 0.118f, 1f));
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
         if (ImGui.Button("OK", new Vector2(btnW, 0f))) {
             var node = _flow!.Nodes.Find(n => n.Id == _condEditNodeId);
             if (node != null) {
                 apply(node);
                 FlowExecutor.InvalidateFlow(_flow.Id);
-                _config.Save();
+                Commit();
             }
             _condEditNodeId = null;
             ImGui.CloseCurrentPopup();

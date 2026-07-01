@@ -10,4 +10,8 @@ public class ComboFlow {
     public bool Enabled { get; set; } = true;
     public List<FlowNode> Nodes { get; set; } = new();
     public List<FlowEdge> Edges { get; set; } = new();
+
+    // Editor canvas pan offset, persisted so reopening restores the view.
+    public float ViewX { get; set; }
+    public float ViewY { get; set; }
 }

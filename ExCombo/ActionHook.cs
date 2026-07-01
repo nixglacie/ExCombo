@@ -44,6 +44,7 @@ internal sealed class ActionHook : IDisposable {
 
     // Called every frame per hotbar slot, and inside UseAction(a5=1) for the queued action.
     private uint Detour(IntPtr actionManager, uint actionId) {
+        if (FlowExecutor.ReplacementSuppressed()) return _hook.Original(actionManager, actionId);   // off or safety-gated
         try {
             foreach (var flow in _config.Flows) {
                 if (!flow.Enabled) continue;
@@ -53,7 +54,7 @@ internal sealed class ActionHook : IDisposable {
                     var r       = FlowExecutor.Resolve(flow, trigger, actionId);
                     var evolved = _hook.Original(actionManager, r);
                     if (!_lastIcon.TryGetValue(actionId, out var prev) || prev != evolved) {
-                        Plugin.Log.Debug($"[ExCombo][Icon] slot={actionId} → {evolved}");
+                        Plugin.LogDebug($"[ExCombo][Icon] slot={actionId} → {evolved}");
                         _lastIcon[actionId] = evolved;
                     }
                     return evolved;
@@ -68,6 +69,12 @@ internal sealed class ActionHook : IDisposable {
     private unsafe bool UseActionDetour(IntPtr actionManager, uint actionType, uint actionId, ulong targetId, uint a4, uint a5, uint a6, IntPtr a7) {
         if (a5 == 1) FlowExecutor.InQueueExecute = true;
 
+        if (FlowExecutor.ReplacementSuppressed()) {   // off or safety-gated → pass through untouched
+            var passthru = _useHook.Original(actionManager, actionType, actionId, targetId, a4, a5, a6, a7);
+            FlowExecutor.InQueueExecute = false;
+            return passthru;
+        }
+
         // Retarget: if the action about to fire belongs to a flow Action node flagged with a built-in
         // resolver, redirect the cast target without changing the player's hard target.
         if (actionType == (uint)ActionType.Action) {
@@ -80,7 +87,7 @@ internal sealed class ActionHook : IDisposable {
                         if (mode == 0) continue;
                         var resolved = Helpers.RetargetResolver.Resolve((RetargetMode)mode);
                         if (resolved is { } tid && tid != 0) {
-                            Plugin.Log.Debug($"[ExCombo][Retarget] id={actionId} mode={(RetargetMode)mode} → {tid}");
+                            Plugin.LogDebug($"[ExCombo][Retarget] id={actionId} mode={(RetargetMode)mode} → {tid}");
                             targetId = tid;
                         }
                         goto resolved_done;
@@ -94,7 +101,7 @@ internal sealed class ActionHook : IDisposable {
 
         var result = _useHook.Original(actionManager, actionType, actionId, targetId, a4, a5, a6, a7);
         FlowExecutor.InQueueExecute = false;
-        Plugin.Log.Debug($"[ExCombo][UseAction] id={actionId} a5={a5} result={result}");
+        Plugin.LogDebug($"[ExCombo][UseAction] id={actionId} a5={a5} result={result}");
 
         if (!result) {
             if (a5 == 1) {

@@ -37,15 +37,29 @@ internal static class FlowExecutor {
 
     private static readonly Dictionary<string, FlowRunState> _states = new();
 
-    private const long ResetAfterMs = 15_000;
-
+    // User-tunable (Configuration); fall back to prior hard-coded defaults if config missing.
+    private static long ResetAfterMs => (Plugin.Config?.ChainResetSeconds ?? 15) * 1000L;
     // Grace after a press before trusting the game's combo state (the game records the combo a frame late).
-    private const long ComboGraceMs = 500;
+    private static long ComboGraceMs => Plugin.Config?.ComboGraceMs ?? 500;
+    private static int  MaxWeaves    => Plugin.Config?.MaxWeavesPerGcd ?? 2;
 
     // Set by ActionHook while inside UseAction(a5=1) original call.
     public static bool InQueueExecute = false;
 
+    // True when action replacement should be off entirely: master switch, or a safety gate
+    // (PvP / occupied-cutscene / out-of-combat). Checked by ActionHook and Tick.
+    public static bool ReplacementSuppressed() {
+        var cfg = Plugin.Config;
+        if (cfg == null) return false;
+        if (!cfg.Enabled) return true;
+        if (cfg.DisableInPvP && Plugin.ClientState.IsPvP) return true;
+        if (cfg.PauseWhenOccupied && Helpers.PlayerStateHelper.IsOccupied()) return true;
+        if (cfg.ReplaceOnlyInCombat && !Helpers.PlayerStateHelper.InCombat()) return true;
+        return false;
+    }
+
     public static void Tick(List<ComboFlow> flows) {
+        if (ReplacementSuppressed()) return;   // master switch off or a safety gate → no progression
         var now = Environment.TickCount64;
         PlayerStateHelper.Update();   // frame-track movement & combat duration for condition checks
         foreach (var flow in flows)
@@ -55,7 +69,7 @@ internal static class FlowExecutor {
 
                 // Stay alive while the game's combo is still running (matches the real combo window).
                 if (s.LastPressedTick > 0 && (now - s.LastPressedTick) > ResetAfterMs && ComboHelper.ComboTimer <= 0) {
-                    Plugin.Log.Debug($"[ExCombo][Tick] trigger={trigger.ActionId} inactive {ResetAfterMs}ms, resetting");
+                    Plugin.LogDebug($"[ExCombo][Tick] trigger={trigger.ActionId} inactive {ResetAfterMs}ms, resetting");
                     ResetState(s);
                     continue;
                 }
@@ -63,7 +77,7 @@ internal static class FlowExecutor {
                 // Detect new GCD window (elapsed went backwards) → reset weave count
                 var gcdElapsed = WeaveHelper.GCDElapsed;
                 if (s.WeavedThisWindow > 0 && gcdElapsed < s.LastGCDElapsed - 0.05f) {
-                    Plugin.Log.Debug($"[ExCombo][Tick] trigger={trigger.ActionId} new GCD window, resetting WeavedThisWindow={s.WeavedThisWindow}→0");
+                    Plugin.LogDebug($"[ExCombo][Tick] trigger={trigger.ActionId} new GCD window, resetting WeavedThisWindow={s.WeavedThisWindow}→0");
                     s.WeavedThisWindow = 0;
                     s.LastTickSkipId   = null;
                 }
@@ -93,7 +107,7 @@ internal static class FlowExecutor {
                                 var ga = ComboHelper.ComboAction;
                                 bool supported = ComboHelper.ComboTimer > 0 && (ga == parent || ga == Adjusted(parent));
                                 if (!supported) {
-                                    Plugin.Log.Debug($"[ExCombo][Combo] trigger={trigger.ActionId} desync (need {parent}, game={ga} t={ComboHelper.ComboTimer:F1}) → reset chain");
+                                    Plugin.LogDebug($"[ExCombo][Combo] trigger={trigger.ActionId} desync (need {parent}, game={ga} t={ComboHelper.ComboTimer:F1}) → reset chain");
                                     ResetActiveChain(flow, trigger, s);
                                 }
                             }
@@ -108,7 +122,7 @@ internal static class FlowExecutor {
                         if (cur == null || !ActionHelper.IsOgcd(cur.ActionId)) break;
                         if (OgcdOffer(s, cur)) break;   // still weaveable (or in grace) → hold
                         if (s.LastTickSkipId != cur.Id) {
-                            Plugin.Log.Debug($"[ExCombo][Tick] trigger={trigger.ActionId} skipping oGCD={cur.ActionId} weaved={s.WeavedThisWindow}");
+                            Plugin.LogDebug($"[ExCombo][Tick] trigger={trigger.ActionId} skipping oGCD={cur.ActionId} weaved={s.WeavedThisWindow}");
                             s.LastTickSkipId = cur.Id;
                         }
                         var prevId = s.NextActionId;
@@ -166,7 +180,7 @@ internal static class FlowExecutor {
         var before = state.NextActionId;
         TrackWeaveCount(flow, state);
         AdvanceState(flow, trigger, state);
-        Plugin.Log.Debug($"[ExCombo][Advance] trigger={trigger.ActionId} {before}→{state.NextActionId} immediate");
+        Plugin.LogDebug($"[ExCombo][Advance] trigger={trigger.ActionId} {before}→{state.NextActionId} immediate");
     }
 
     public static void NotifyQueueFailed(ComboFlow flow, FlowNode trigger) {
@@ -175,7 +189,7 @@ internal static class FlowExecutor {
         state.PendingFire  = false;
         state.FrozenReturn = 0;
         // Don't advance — action didn't fire; player should retry
-        Plugin.Log.Debug($"[ExCombo][QueueFail] trigger={trigger.ActionId} unfrozen, retry same action");
+        Plugin.LogDebug($"[ExCombo][QueueFail] trigger={trigger.ActionId} unfrozen, retry same action");
     }
 
     public static void NotifyQueued(ComboFlow flow, FlowNode trigger, uint frozenReturn) {
@@ -193,13 +207,13 @@ internal static class FlowExecutor {
                 if (state.NextActionId == "" || state.NextActionId == prevId) break;
             }
             state.LastPressedTick = Environment.TickCount64;
-            Plugin.Log.Debug($"[ExCombo][Queue] trigger={trigger.ActionId} oGCD skipped, advanced to {state.NextActionId}");
+            Plugin.LogDebug($"[ExCombo][Queue] trigger={trigger.ActionId} oGCD skipped, advanced to {state.NextActionId}");
             return;
         }
         state.PendingFire     = true;
         state.FrozenReturn    = frozenReturn;
         state.LastPressedTick = Environment.TickCount64;
-        Plugin.Log.Debug($"[ExCombo][Queue] trigger={trigger.ActionId} frozen={frozenReturn} next={state.NextActionId}");
+        Plugin.LogDebug($"[ExCombo][Queue] trigger={trigger.ActionId} frozen={frozenReturn} next={state.NextActionId}");
     }
 
     public static void NotifyFired(ComboFlow flow, FlowNode trigger) {
@@ -211,7 +225,44 @@ internal static class FlowExecutor {
         state.LastPressedTick = Environment.TickCount64;
         TrackWeaveCount(flow, state);
         AdvanceState(flow, trigger, state);
-        Plugin.Log.Debug($"[ExCombo][Fired] trigger={trigger.ActionId} {before}→{state.NextActionId}");
+        Plugin.LogDebug($"[ExCombo][Fired] trigger={trigger.ActionId} {before}→{state.NextActionId}");
+    }
+
+    // ── Inspection (debug overlay / condition inspector) ─────────────────
+
+    // Live evaluation of a gate node against current game state. Used by the editor to tint gates.
+    public static bool EvalGate(ComboFlow flow, FlowNode node) => EvaluateCondition(flow.Job, node);
+
+    public readonly record struct TriggerDbg(
+        string FlowName, string Job, uint TriggerId, string TriggerLabel, bool HasState,
+        uint NextActionId, string NextLabel, bool Pending,
+        int Weaved, int MaxWeaves, bool WeaveOpen, uint Spine, int BranchPort, bool Committed);
+
+    // Per-trigger runtime snapshot for the debug overlay. Only enabled flows.
+    public static List<TriggerDbg> Snapshot(List<ComboFlow> flows) {
+        var list = new List<TriggerDbg>();
+        foreach (var flow in flows) {
+            if (!flow.Enabled) continue;
+            foreach (var trigger in flow.Nodes) {
+                if (trigger.Type != NodeType.Trigger) continue;
+                var has  = _states.TryGetValue(Key(flow, trigger), out var s);
+                var node = has && s!.NextActionId != "" ? flow.Nodes.Find(n => n.Id == s.NextActionId) : null;
+                list.Add(new TriggerDbg(
+                    flow.Name, flow.Job, trigger.ActionId,
+                    trigger.ActionLabel.Length > 0 ? trigger.ActionLabel : trigger.ActionId.ToString(),
+                    has,
+                    node?.ActionId ?? 0,
+                    node?.ActionLabel ?? "—",
+                    has && s!.PendingFire,
+                    has ? s!.WeavedThisWindow : 0,
+                    MaxWeaves,
+                    has && WeaveWindowOpen(s!),
+                    has ? SpineLookahead(flow, s!) : 0,
+                    has ? s!.CurrentBranchPort : -1,
+                    has && s!.CommittedBranchId != null));
+            }
+        }
+        return list;
     }
 
     public static void InvalidateFlow(string flowId) {
@@ -373,7 +424,7 @@ internal static class FlowExecutor {
                         var i = rr.progress;
                         while (i < rr.chain.Count && ActionHelper.IsOgcd(rr.chain[i].ActionId)) i++;
                         if (i < rr.chain.Count) {
-                            Plugin.Log.Debug($"[ExCombo][Branch] skip oGCD={rr.cand.ActionId} → next={rr.chain[i].ActionId}");
+                            Plugin.LogDebug($"[ExCombo][Branch] skip oGCD={rr.cand.ActionId} → next={rr.chain[i].ActionId}");
                             bs.SetProgress(port, i);
                             bs.ActivePort           = port;
                             state.CurrentBranchId   = branchNode.Id;
@@ -490,7 +541,7 @@ internal static class FlowExecutor {
     // True while a GCD is rolling, the weave budget isn't spent, and the window hasn't closed.
     private static bool WeaveWindowOpen(FlowRunState state) =>
         WeaveHelper.IsGcdRolling
-        && state.WeavedThisWindow < 2
+        && state.WeavedThisWindow < MaxWeaves
         && !WeaveHelper.IsWeaveWindowExpired();
 
     // Should this inline oGCD still be offered (shown/fired) this frame? It's an overlay on the GCD

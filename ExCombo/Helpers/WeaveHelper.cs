@@ -3,8 +3,9 @@ using FFXIVClientStructs.FFXIV.Client.Game;
 namespace ExCombo.Helpers;
 
 internal static unsafe class WeaveHelper {
-    private const float BaseAnimLock    = 0.6f;
-    private const float BaseActionQueue = 0.5f;
+    // User-tunable (Configuration) with the prior hard-coded values as fallback.
+    private static float BaseAnimLock    => Plugin.Config?.AnimLockBudget ?? 0.6f;
+    private static float BaseActionQueue => Plugin.Config?.QueueBudget    ?? 0.5f;
 
     private static float RemainingGCD {
         get {

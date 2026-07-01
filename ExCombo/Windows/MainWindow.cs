@@ -77,9 +77,9 @@ public class MainWindow : Window {
 
     public override void Draw() {
         // ── Toolbar ──────────────────────────────────────────────────────
-        ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.455f, 0.765f, 1.000f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.592f, 0.831f, 1.000f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.350f, 0.650f, 0.900f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Button,        Style.AccentColor);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Style.AccentHover);
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.AccentActive);
         ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.102f, 0.106f, 0.118f, 1f));
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(14f, 6f));
         if (ImGui.Button("+ New Flow")) {
@@ -104,7 +104,7 @@ public class MainWindow : Window {
             ImGui.SameLine(ImGui.GetWindowWidth() - padX - btnW);
             ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.173f, 0.180f, 0.200f, 1f));
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.333f, 0.353f, 0.388f, 1f));
-            ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.455f, 0.765f, 1f, 0.20f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.Accent(0.20f));
             ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.565f, 0.573f, 0.588f, 1f));
             if (ImGuiComponents.IconButton(FontAwesomeIcon.Cog))
                 _configWindow.IsOpen = !_configWindow.IsOpen;
@@ -146,8 +146,11 @@ public class MainWindow : Window {
         var dl   = ImGui.GetWindowDrawList();
         var rowH = Math.Max(ImGui.GetFrameHeight(), ListIconSz) + RowPadY * 2f;
 
-        string? toDelete = null;
-        string? toEdit   = null;
+        string? toDelete   = null;
+        string? toEdit     = null;
+        string? toClone    = null;
+        string? toMoveUp   = null;
+        string? toMoveDown = null;
 
         // Bucket flows by job, preserving RoleGroups job order
         var jobOrder = RoleGroups.SelectMany(g => g.Jobs).ToList();
@@ -205,10 +208,10 @@ public class MainWindow : Window {
                 bool hover = mouse.X >= rowMin.X && mouse.X <= rowMax.X
                           && mouse.Y >= rowMin.Y && mouse.Y <= rowMax.Y;
 
-                uint rowBg   = isActive ? Col(0.455f, 0.765f, 1f, 0.08f)
+                uint rowBg   = isActive ? Style.AccentU32(0.08f)
                              : hover    ? Col(0.173f, 0.180f, 0.200f, 0.9f)
                                         : Col(0.145f, 0.149f, 0.169f, 0.7f);
-                uint rowBord = isActive ? Col(0.455f, 0.765f, 1f, 0.40f)
+                uint rowBord = isActive ? Style.AccentU32(0.40f)
                                         : Col(0.333f, 0.353f, 0.388f, 0.6f);
 
                 dl.AddRectFilled(rowMin, rowMax, rowBg,   6f);
@@ -270,6 +273,20 @@ public class MainWindow : Window {
                         _renamingId    = flow.Id;
                         _pendingRename = flow.Name;
                     }
+                    if (ImGui.IsItemHovered()) Tip("Double-click to rename · right-click to reorder");
+                    if (ImGui.IsItemClicked(ImGuiMouseButton.Right)) ImGui.OpenPopup("##flowctx");
+                    if (ImGui.BeginPopup("##flowctx")) {
+                        int  gi    = groupFlows.IndexOf(flow);
+                        bool first = gi <= 0;
+                        bool last  = gi >= groupFlows.Count - 1;
+                        if (first) ImGui.BeginDisabled();
+                        if (ImGui.MenuItem("Move up"))   toMoveUp = flow.Id;
+                        if (first) ImGui.EndDisabled();
+                        if (last) ImGui.BeginDisabled();
+                        if (ImGui.MenuItem("Move down")) toMoveDown = flow.Id;
+                        if (last) ImGui.EndDisabled();
+                        ImGui.EndPopup();
+                    }
 
                     // ── Conflict warning (disabled flow blocked by an active one) ──
                     if (!flow.Enabled && FindTriggerConflict(flow) is { } cf) {
@@ -292,9 +309,10 @@ public class MainWindow : Window {
                 const float IcoGap = 4f;
                 float winW  = ImGui.GetWindowWidth();
                 float padX  = ImGui.GetStyle().WindowPadding.X;
-                float delX  = winW - padX - RowPadX - IcoSz;
-                float expX  = delX  - IcoGap - IcoSz;
-                float editX = expX  - IcoGap - IcoSz;
+                float delX   = winW - padX - RowPadX - IcoSz;
+                float expX   = delX   - IcoGap - IcoSz;
+                float cloneX = expX   - IcoGap - IcoSz;
+                float editX  = cloneX - IcoGap - IcoSz;
                 float btnY  = midY - IcoSz / 2f - winPos.Y + scrollY;
 
                 var icoSize = new Vector2(IcoSz, IcoSz);
@@ -320,10 +338,10 @@ public class MainWindow : Window {
 
                 // Edit (pen)
                 ImGui.SetCursorPos(new Vector2(editX, btnY));
-                ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.455f, 0.765f, 1f, 0.12f));
-                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.455f, 0.765f, 1f, 0.25f));
-                ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.455f, 0.765f, 1f, 0.40f));
-                ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.455f, 0.765f, 1f, 0.85f));
+                ImGui.PushStyleColor(ImGuiCol.Button,        Style.Accent(0.12f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Style.Accent(0.25f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.Accent(0.40f));
+                ImGui.PushStyleColor(ImGuiCol.Text,          Style.Accent(0.85f));
                 if (ImGuiComponents.IconButton(FontAwesomeIcon.Pen, icoSize)) toEdit = flow.Id;
                 ImGui.PopStyleColor(4);
                 if (ImGui.IsItemHovered()) Tip("Edit");
@@ -332,11 +350,21 @@ public class MainWindow : Window {
                 ImGui.SetCursorPos(new Vector2(expX, btnY));
                 ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.173f, 0.180f, 0.200f, 1f));
                 ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.333f, 0.353f, 0.388f, 1f));
-                ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.455f, 0.765f, 1f, 0.20f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.Accent(0.20f));
                 ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.565f, 0.573f, 0.588f, 1f));
                 if (ImGuiComponents.IconButton(FontAwesomeIcon.FileExport, icoSize)) ExportFlow(flow);
                 ImGui.PopStyleColor(4);
                 if (ImGui.IsItemHovered()) Tip("Export to clipboard");
+
+                // Duplicate (copy)
+                ImGui.SetCursorPos(new Vector2(cloneX, btnY));
+                ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.173f, 0.180f, 0.200f, 1f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.333f, 0.353f, 0.388f, 1f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.Accent(0.20f));
+                ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.565f, 0.573f, 0.588f, 1f));
+                if (ImGuiComponents.IconButton(FontAwesomeIcon.Copy, icoSize)) toClone = flow.Id;
+                ImGui.PopStyleColor(4);
+                if (ImGui.IsItemHovered()) Tip("Duplicate");
 
                 // Delete (trash)
                 ImGui.SetCursorPos(new Vector2(delX, btnY));
@@ -367,6 +395,9 @@ public class MainWindow : Window {
             var f = _config.Flows.Find(f2 => f2.Id == toEdit);
             if (f != null) { _editor.SetFlow(f); _editor.IsOpen = true; }
         }
+        if (toClone != null) CloneFlow(toClone);
+        if (toMoveUp   != null) MoveFlow(toMoveUp,   -1);
+        if (toMoveDown != null) MoveFlow(toMoveDown, +1);
 
         if (!anyFlow) {
             ImGui.Spacing();
@@ -381,7 +412,7 @@ public class MainWindow : Window {
             ImGui.Begin("##newFlowDlg", ref _dlgVisible,
                 ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoCollapse);
 
-            ImGui.TextColored(new Vector4(0.455f, 0.765f, 1f, 1f), "New Flow");
+            ImGui.TextColored(Style.AccentColor, "New Flow");
             ImGui.Separator();
             ImGui.Spacing();
 
@@ -402,8 +433,8 @@ public class MainWindow : Window {
 
             bool canCreate = _newFlowName.Trim().Length > 0 && _newFlowJob.Length > 0;
             if (!canCreate) ImGui.BeginDisabled();
-            ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.455f, 0.765f, 1f, 1f));
-            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.592f, 0.831f, 1f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.Button,        Style.AccentColor);
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Style.AccentHover);
             ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.102f, 0.106f, 0.118f, 1f));
             if (ImGui.Button("Create", new Vector2(-1f, 0f))) {
                 var flow = new ComboFlow {
@@ -448,7 +479,7 @@ public class MainWindow : Window {
                 if (sel)
                     wdl.AddRectFilled(pos - new Vector2(2f, 2f),
                                       pos + new Vector2(IconSz + 2f, IconSz + 2f),
-                                      Col(0.455f, 0.765f, 1f, 0.22f), 5f);
+                                      Style.AccentU32(0.22f), 5f);
 
                 // Icon or text fallback
                 IDalamudTextureWrap? wrap = JobIcons.TryGetValue(abbrev, out var iid) ? GetIconWrap(iid) : null;
@@ -456,7 +487,7 @@ public class MainWindow : Window {
                     ImGui.Image(wrap.Handle, new Vector2(IconSz, IconSz));
                 } else {
                     ImGui.PushStyleColor(ImGuiCol.Button,
-                        sel ? new Vector4(0.455f, 0.765f, 1f, 0.3f) : new Vector4(0.173f, 0.180f, 0.200f, 1f));
+                        sel ? Style.Accent(0.3f) : new Vector4(0.173f, 0.180f, 0.200f, 1f));
                     ImGui.Button(abbrev, new Vector2(IconSz, IconSz));
                     ImGui.PopStyleColor();
                 }
@@ -467,7 +498,7 @@ public class MainWindow : Window {
                 if (ImGui.IsItemHovered()) {
                     wdl.AddRectFilled(pos - new Vector2(2f, 2f),
                                       pos + new Vector2(IconSz + 2f, IconSz + 2f),
-                                      Col(0.455f, 0.765f, 1f, 0.10f), 5f);
+                                      Style.AccentU32(0.10f), 5f);
                     Tip(abbrev);
                 }
 
@@ -475,7 +506,7 @@ public class MainWindow : Window {
                 if (sel)
                     wdl.AddRect(pos - new Vector2(2f, 2f),
                                 pos + new Vector2(IconSz + 2f, IconSz + 2f),
-                                Col(0.455f, 0.765f, 1f), 5f, ImDrawFlags.None, 2f);
+                                Style.AccentU32(), 5f, ImDrawFlags.None, 2f);
             }
         }
 
@@ -484,6 +515,41 @@ public class MainWindow : Window {
     private void CommitRename(ComboFlow flow) {
         if (_pendingRename.Trim().Length > 0) flow.Name = _pendingRename.Trim();
         _renamingId = null;
+        _config.Save();
+    }
+
+    // Duplicate a flow (deep copy via JSON). New id, disabled so it can't collide with the original's
+    // trigger; user renames/enables it manually.
+    private void CloneFlow(string id) {
+        var src = _config.Flows.Find(f => f.Id == id);
+        if (src == null) return;
+        try {
+            var copy = JsonSerializer.Deserialize<ComboFlow>(JsonSerializer.Serialize(src, JsonOpts), JsonOpts);
+            if (copy == null) { SetStatus("Duplicate failed.", error: true); return; }
+            copy.Id      = Guid.NewGuid().ToString();
+            copy.Name    = src.Name + " (copy)";
+            copy.Enabled = false;
+            _config.Flows.Add(copy);
+            _config.Save();
+            SetStatus($"Duplicated \"{src.Name}\"");
+        } catch {
+            SetStatus("Duplicate failed.", error: true);
+        }
+    }
+
+    // Reorder a flow among its same-job siblings in Configuration.Flows. Flow precedence (ActionHook
+    // scans Flows in order, first match wins) follows this list order.
+    private void MoveFlow(string id, int dir) {
+        var flow = _config.Flows.Find(f => f.Id == id);
+        if (flow == null) return;
+        var siblings = _config.Flows.Where(f => f.Job == flow.Job).ToList();
+        int si = siblings.IndexOf(flow);
+        int ti = si + dir;
+        if (ti < 0 || ti >= siblings.Count) return;
+        var target = siblings[ti];
+        int a = _config.Flows.IndexOf(flow);
+        int b = _config.Flows.IndexOf(target);
+        (_config.Flows[a], _config.Flows[b]) = (_config.Flows[b], _config.Flows[a]);
         _config.Save();
     }
 

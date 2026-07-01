@@ -24,11 +24,20 @@ public sealed class Plugin : IDalamudPlugin {
     [PluginService] internal static ICondition              Condition           { get; private set; } = null!;
     [PluginService] internal static IPartyList              PartyList           { get; private set; } = null!;
 
+    // Shared config handle for the static runtime (ActionHook / FlowExecutor / WeaveHelper).
+    internal static Configuration Config { get; private set; } = null!;
+
+    // Level-gated debug log — silenced unless LogLevel.Verbose. Errors bypass this (call Log.Error).
+    internal static void LogDebug(string msg) {
+        if (Config is { LogLevel: LogLevel.Verbose }) Log.Debug(msg);
+    }
+
     private readonly Configuration    _config;
     private readonly WindowSystem     _windowSystem = new("ExCombo");
     private readonly MainWindow       _mainWindow;
     private readonly FlowEditorWindow _editorWindow;
     private readonly ConfigWindow     _configWindow;
+    private readonly DebugWindow      _debugWindow;
     private readonly IDtrBarEntry     _dtrEntry;
     private readonly ActionHook       _actionHook;
 
@@ -36,15 +45,18 @@ public sealed class Plugin : IDalamudPlugin {
 
     public Plugin() {
         _config     = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        Config      = _config;
         _actionHook = new ActionHook(_config);
 
         _editorWindow = new FlowEditorWindow(_config);
-        _configWindow = new ConfigWindow(_config);
+        _debugWindow  = new DebugWindow(_config);
+        _configWindow = new ConfigWindow(_config, _debugWindow);
         _mainWindow   = new MainWindow(_config, _editorWindow, _configWindow);
 
         _windowSystem.AddWindow(_mainWindow);
         _windowSystem.AddWindow(_editorWindow);
         _windowSystem.AddWindow(_configWindow);
+        _windowSystem.AddWindow(_debugWindow);
 
         CommandManager.AddHandler(Command, new CommandInfo(OnCommand) {
             HelpMessage = "Open ExCombo rotation flow editor.",
