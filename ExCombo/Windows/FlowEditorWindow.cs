@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
+using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Textures;
 using Dalamud.Interface.Windowing;
 using ExCombo.Flow;
@@ -39,6 +41,19 @@ public class FlowEditorWindow : Window {
     private int     _condEditOp;
     private int     _condEditVal;
 
+    // Parameterized-condition (Status/Cooldown/Target/Player/Party) edit state.
+    private NodeType _condEditType;
+    private float    _condEditValF;
+    private uint     _condParamId;
+    private uint     _condParamIcon;
+    private string   _condParamLabel  = "";
+    private float    _condParam2;
+    private int      _condTarget;
+    private string   _condParamSearch = "";
+    private readonly List<(uint Id, string Name, uint Icon, byte Level)> _condParamResults = new();
+    private string   _condParamLastSearch = "\0";
+    private CheckParamKind _condParamLastKind = CheckParamKind.None;
+
     private string? _noteEditNodeId;
     private string  _noteEditText = "";
     private string? _resizingNoteId;
@@ -51,13 +66,21 @@ public class FlowEditorWindow : Window {
 
     private static readonly Dictionary<string, uint> _jobIconCache = new();
 
+    // Large FontAwesome handle for the Target/Player/Party node glyphs (baked at size → sharp).
+    private const float GlyphPx = 32f;
+    private IFontHandle? _iconFontLarge;
+    private IFontHandle IconFontLarge => _iconFontLarge ??=
+        Plugin.PluginInterface.UiBuilder.FontAtlas.NewDelegateFontHandle(e =>
+            e.OnPreBuild(tk => tk.AddFontAwesomeIconFont(new SafeFontConfig { SizePx = GlyphPx })));
+
     private readonly HashSet<string> _selectedNodeIds = new();
     private bool    _isMarqueeSelecting;
     private Vector2 _marqueeStart;
     private Vector2 _marqueeEnd;
 
-    private List<(string OrigId, NodeType Type, float RelX, float RelY, uint ActionId, string ActionLabel, uint IconId, int OutputCount, string CondField, int CondOp, int CondVal, bool IsOgcd)>? _clipboardNodes;
-    private List<(string FromOrig, string ToOrig, int PortIdx)>?                                                                                                                                                                                                   _clipboardEdges;
+    // Whole-node clones carry every field (future-proof against new FlowNode props).
+    private List<(string OrigId, FlowNode Node, float RelX, float RelY)>? _clipboardNodes;
+    private List<(string FromOrig, string ToOrig, int PortIdx)>?          _clipboardEdges;
 
     private static readonly Vector2 NodeSize    = new(64f, 64f);
     private const           float   PortRadius  = 6f;
@@ -84,6 +107,43 @@ public class FlowEditorWindow : Window {
             ImGui.PopFont();
         }
         return result;
+    }
+
+    private static readonly Dictionary<string, Vector2> _iconMenuOffset = new();
+
+    // Same icon-overlay trick as IconMenuItem, but for a submenu header (ImGui.BeginMenu).
+    // When the submenu opens, the last-item rect no longer references the header, so its rect is
+    // only reliable on closed frames. Capture the cursor up front, derive the exact icon offset
+    // from the rect while closed and cache it, then reuse that offset while open — pixel-stable.
+    private static bool IconBeginMenu(FontAwesomeIcon icon, string label, uint? iconColor = null) {
+        var dl     = ImGui.GetWindowDrawList();
+        var rowPos = ImGui.GetCursorScreenPos();
+        ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
+        var iconStr = icon.ToIconString();
+        var iconW   = ImGui.CalcTextSize(iconStr).X;
+        ImGui.PopFont();
+        var spaceW  = MathF.Max(ImGui.CalcTextSize(" ").X, 1f);
+        var pad     = (int)MathF.Ceiling((iconW + 10f) / spaceW);
+        var sz      = ImGui.GetFontSize();
+
+        var open    = ImGui.BeginMenu(new string(' ', pad) + label);
+
+        Vector2 off;
+        if (!open) {
+            var rMin = ImGui.GetItemRectMin();
+            var rMax = ImGui.GetItemRectMax();
+            off = new Vector2(rMin.X + 4f - rowPos.X, rMin.Y + (rMax.Y - rMin.Y - sz) * 0.5f - rowPos.Y);
+            _iconMenuOffset[label] = off;
+        } else {
+            off = _iconMenuOffset.TryGetValue(label, out var c)
+                ? c : new Vector2(4f, ImGui.GetStyle().FramePadding.Y);
+        }
+
+        var col = iconColor ?? ImGui.GetColorU32(ImGuiCol.Text);
+        ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
+        dl.AddText(rowPos + off, col, iconStr);
+        ImGui.PopFont();
+        return open;
     }
 
     private static void DrawDashedRect(ImDrawListPtr dl, Vector2 min, Vector2 max,
@@ -126,12 +186,13 @@ public class FlowEditorWindow : Window {
     private static float NodeHeight(FlowNode n) =>
         n.Type == NodeType.Note
             ? n.NoteH
-            : n.Type is NodeType.Branch or NodeType.Condition
+            : n.Type == NodeType.Branch || FlowNode.IsGate(n.Type)
                 ? MathF.Max(NodeSize.Y, BranchSlotH * n.OutputCount)
                 : NodeSize.Y;
 
     private const float NoteMinW = 96f;
     private const float NoteMinH = 64f;
+    private const float CondW    = 360f;   // content width for the content-sized condition modal
     private static float NodeWidthOf(FlowNode n) => n.Type == NodeType.Note ? n.NoteW : NodeSize.X;
 
     private static uint Col(float r, float g, float b, float a = 1f) =>
@@ -144,6 +205,11 @@ public class FlowEditorWindow : Window {
             MaximumSize = new Vector2(9999, 9999),
         };
         _config = config;
+    }
+
+    public void Dispose() {
+        _iconFontLarge?.Dispose();
+        _iconFontLarge = null;
     }
 
     public void SetFlow(ComboFlow flow) {
@@ -189,7 +255,7 @@ public class FlowEditorWindow : Window {
             if (fn == null || tn == null) continue;
 
             Vector2 p1;
-            if (fn.Type is NodeType.Branch or NodeType.Condition) {
+            if (fn.Type == NodeType.Branch || FlowNode.IsGate(fn.Type)) {
                 var slotY = fn.Y + (edge.FromPortIndex + 0.5f) * BranchSlotH;
                 p1 = canvasMin + _canvasOffset + new Vector2(fn.X + NodeSize.X, slotY);
             } else {
@@ -198,7 +264,11 @@ public class FlowEditorWindow : Window {
             var p4  = canvasMin + _canvasOffset + new Vector2(tn.X, tn.Y + NodeHeight(tn) * 0.5f);
             var cp1 = p1 + new Vector2(60, 0);
             var cp2 = p4 - new Vector2(60, 0);
-            dl.AddBezierCubic(p1, cp1, cp2, p4, Col(0.4f, 0.6f, 1f, 0.85f), 2f);
+            // Gate (condition) edges are colored by branch: port 0 = true (green), port 1 = false (red).
+            var edgeCol = FlowNode.IsGate(fn.Type)
+                ? (edge.FromPortIndex == 0 ? Col(0.30f, 0.80f, 0.30f, 0.9f) : Col(0.85f, 0.30f, 0.30f, 0.9f))
+                : Col(0.4f, 0.6f, 1f, 0.85f);
+            dl.AddBezierCubic(p1, cp1, cp2, p4, edgeCol, 2f);
 
             // ── Delete button at midpoint ─────────────────────────────────
             var mid     = 0.125f*p1 + 0.375f*cp1 + 0.375f*cp2 + 0.125f*p4;
@@ -223,7 +293,7 @@ public class FlowEditorWindow : Window {
             var wfn       = _flow.Nodes.Find(n => n.Id == _wireFromNodeId);
             if (wfn != null) {
                 Vector2 p1;
-                if (wfn.Type is NodeType.Branch or NodeType.Condition) {
+                if (wfn.Type == NodeType.Branch || FlowNode.IsGate(wfn.Type)) {
                     var slotY = wfn.Y + (_wireFromPortIndex + 0.5f) * BranchSlotH;
                     p1 = canvasMin + _canvasOffset + new Vector2(wfn.X + NodeSize.X, slotY);
                 } else {
@@ -236,8 +306,10 @@ public class FlowEditorWindow : Window {
                     var tip = canvasMin + _canvasOffset + new Vector2(t.X, t.Y + NodeHeight(t) * 0.5f);
                     if (Vector2.Distance(wireMouse, tip) < PortRadius * 3f) { wireEnd = tip; break; }
                 }
-                dl.AddBezierCubic(p1, p1 + new Vector2(60, 0), wireEnd - new Vector2(60, 0), wireEnd,
-                    Col(0.4f, 0.6f, 1f, 0.5f), 2f);
+                var wireCol = FlowNode.IsGate(wfn.Type)
+                    ? (_wireFromPortIndex == 0 ? Col(0.30f, 0.80f, 0.30f, 0.6f) : Col(0.85f, 0.30f, 0.30f, 0.6f))
+                    : Col(0.4f, 0.6f, 1f, 0.5f);
+                dl.AddBezierCubic(p1, p1 + new Vector2(60, 0), wireEnd - new Vector2(60, 0), wireEnd, wireCol, 2f);
             }
 
             if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) {
@@ -350,7 +422,8 @@ public class FlowEditorWindow : Window {
         foreach (var node in _flow.Nodes) {
             var isTrigger   = node.Type == NodeType.Trigger;
             var isBranch    = node.Type == NodeType.Branch;
-            var isCondition = node.Type == NodeType.Condition;
+            var isGate      = FlowNode.IsGate(node.Type);
+            var isJobCond   = node.Type == NodeType.Condition;
             var isNote      = node.Type == NodeType.Note;
             var nodeH       = NodeHeight(node);
             var nodeW       = NodeWidthOf(node);
@@ -365,7 +438,7 @@ public class FlowEditorWindow : Window {
                 // Note nodes are pure comments — no ports; bottom-right corner = resize handle.
                 if (_wireFromNodeId == null)
                     overNoteResize = Vector2.Distance(mouse2, sp + new Vector2(nodeW, nodeH)) < 12f;
-            } else if (isBranch || isCondition) {
+            } else if (isBranch || isGate) {
                 if (_wireFromNodeId == null) {
                     for (var p = 0; p < node.OutputCount; p++) {
                         var portPos = sp + new Vector2(NodeSize.X, (p + 0.5f) * BranchSlotH);
@@ -448,14 +521,14 @@ public class FlowEditorWindow : Window {
             // ── Wire start ────────────────────────────────────────────────
             if (overOutPort && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
                 _wireFromNodeId    = node.Id;
-                _wireFromPortIndex = (isBranch || isCondition) ? overOutPortIdx : 0;
+                _wireFromPortIndex = (isBranch || isGate) ? overOutPortIdx : 0;
             }
 
             if (nodeHovered && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
-                if (isBranch)         OpenBranchEdit(node.Id, node.OutputCount);
-                else if (isCondition) OpenConditionEdit(node.Id);
-                else if (isNote)      OpenNoteEdit(node.Id);
-                else                  OpenPicker(node.Id);
+                if (isBranch)    OpenBranchEdit(node.Id, node.OutputCount);
+                else if (isGate) OpenConditionEdit(node.Id);
+                else if (isNote) OpenNoteEdit(node.Id);
+                else             OpenPicker(node.Id);
             }
 
             if (nodeHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
@@ -567,8 +640,8 @@ public class FlowEditorWindow : Window {
                     if (xHov && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
                         _pendingDeleteNodeId = node.Id;
                 }
-            } else if (isCondition) {
-                // ── Condition node draw ───────────────────────────────────
+            } else if (isGate) {
+                // ── Condition-family node draw (all gate types) ───────────
                 var condAccent = Col(0.90f, 0.63f, 0.31f);
                 var borderCol  = isSelected
                     ? Col(1f, 1f, 1f)
@@ -577,21 +650,48 @@ public class FlowEditorWindow : Window {
                         : Col(0.90f, 0.63f, 0.31f, 0.5f);
                 dl.AddRectFilled(sp, sp + new Vector2(NodeSize.X, nodeH), Col(0.12f, 0.08f, 0.03f), 6f);
 
-                // Job icon (dimmed, fills the node body)
-                var jobIconId = GetJobIconId(_flow!.Job);
-                if (jobIconId != 0) {
+                // Body icon: legacy job gauge = job icon; Status/Cooldown = picked status/action icon;
+                // Target/Player/Party = a category glyph.
+                if (isJobCond) {
+                    var jobIconId = GetJobIconId(_flow!.Job);
+                    if (jobIconId != 0) {
+                        var tex = Plugin.TextureProvider
+                            .GetFromGameIcon(new GameIconLookup(jobIconId))?.GetWrapOrDefault();
+                        if (tex != null)
+                            DrawHelpers.DrawIcon(dl, tex, sp, new Vector2(NodeSize.X, nodeH), 1f, 6f);
+                    }
+                } else if (node.Type is NodeType.StatusCondition or NodeType.CooldownCondition && node.IconId != 0) {  // (is-or) && bool
                     var tex = Plugin.TextureProvider
-                        .GetFromGameIcon(new GameIconLookup(jobIconId))?.GetWrapOrDefault();
-                    if (tex != null)
-                        DrawHelpers.DrawIcon(dl, tex, sp, new Vector2(NodeSize.X, nodeH), 1f);
+                        .GetFromGameIcon(new GameIconLookup(node.IconId))?.GetWrapOrDefault();
+                    if (tex != null) {
+                        // Aspect-fit centered in the body (status icons aren't square).
+                        var scale = MathF.Min(NodeSize.X / tex.Width, nodeH / tex.Height);
+                        var isz   = new Vector2(tex.Width * scale, tex.Height * scale);
+                        // Status art has transparent top padding — nudge it down a few px to sit centered.
+                        var iyAdj = node.Type == NodeType.StatusCondition ? 3.5f : 0f;
+                        var ioff  = new Vector2((NodeSize.X - isz.X) * 0.5f, (nodeH - isz.Y) * 0.5f + iyAdj);
+                        DrawHelpers.DrawIcon(dl, tex, sp + ioff, isz, 1f, 6f);
+                    }
+                } else if (node.Type is NodeType.TargetCondition or NodeType.PlayerCondition or NodeType.PartyCondition) {
+                    var glyph = node.Type switch {
+                        NodeType.TargetCondition => FontAwesomeIcon.Crosshairs,
+                        NodeType.PlayerCondition => FontAwesomeIcon.User,
+                        _                        => FontAwesomeIcon.Users,
+                    };
+                    var gstr = glyph.ToIconString();
+                    using (IconFontLarge.Push()) {
+                        var font = ImGui.GetFont();
+                        var sz   = ImGui.GetFontSize();
+                        var gsz  = ImGui.CalcTextSize(gstr);
+                        dl.AddText(font, sz, sp + new Vector2((NodeSize.X - gsz.X) * 0.5f, (nodeH - gsz.Y) * 0.5f),
+                            Col(0.90f, 0.63f, 0.31f, 0.85f), gstr);
+                    }
                 }
 
                 dl.AddRect(sp, sp + new Vector2(NodeSize.X, nodeH), borderCol, 6f, ImDrawFlags.None,
                     isSelected || nodeHovered ? 2f : 1.5f);
 
-                var condLabel      = node.ConditionField != ""
-                    ? $"{node.ConditionField} {((CompareOp)node.ConditionCompareOp).ToLabel()} {node.ConditionCompareVal}"
-                    : "Job Condition";
+                var condLabel      = GateNodeLabel(node);
                 var condLabelWidth = ImGui.CalcTextSize(condLabel).X;
                 var condLabelPos   = sp + new Vector2((NodeSize.X - condLabelWidth) * 0.5f, -16f);
                 DrawHelpers.DrawText(dl, condLabelPos, condLabel, condAccent, true);
@@ -602,20 +702,15 @@ public class FlowEditorWindow : Window {
                 dl.AddCircleFilled(inPort, PortRadius, overInPort ? Col(0.3f, 0.9f, 0.3f) : Col(0.25f, 0.25f, 0.35f));
                 dl.AddCircle(inPort, PortRadius, overInPort ? Col(0.4f, 1f, 0.4f) : Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
 
-                // Output ports: port 0 = T (green), port 1 = F (red)
+                // Output ports: port 0 = true (green), port 1 = false (red)
                 for (var p = 0; p < node.OutputCount; p++) {
                     var portPos     = sp + new Vector2(NodeSize.X, (p + 0.5f) * BranchSlotH);
                     var portHovered = overOutPort && overOutPortIdx == p;
-                    dl.AddCircleFilled(portPos, PortRadius,
-                        portHovered ? Col(0.6f, 0.8f, 1f) : Col(0.25f, 0.25f, 0.35f));
-                    dl.AddCircle(portPos, PortRadius, Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
-
-                    var portLabel = p == 0 ? "T" : "F";
-                    var portLabelCol = p == 0 ? Col(0.35f, 0.90f, 0.35f, 0.9f) : Col(0.90f, 0.35f, 0.35f, 0.9f);
-                    var plW = ImGui.CalcTextSize(portLabel).X;
-                    DrawHelpers.DrawText(dl, portPos + new Vector2(-plW - PortRadius - 4f, -7f),
-                        portLabel, portLabelCol, false);
-
+                    var ring = p == 0
+                        ? (portHovered ? Col(0.45f, 1f, 0.45f) : Col(0.30f, 0.78f, 0.30f))
+                        : (portHovered ? Col(1f, 0.45f, 0.45f) : Col(0.80f, 0.28f, 0.28f));
+                    dl.AddCircleFilled(portPos, PortRadius, Col(0.25f, 0.25f, 0.35f));
+                    dl.AddCircle(portPos, PortRadius, ring, 12, 1.5f);
                 }
 
                 // Delete button (top-right)
@@ -649,28 +744,34 @@ public class FlowEditorWindow : Window {
                     var tex = Plugin.TextureProvider
                         .GetFromGameIcon(new GameIconLookup(node.IconId))?.GetWrapOrDefault();
                     if (tex != null)
-                        DrawHelpers.DrawIcon(dl, tex, sp, NodeSize, 1f);
+                        DrawHelpers.DrawIcon(dl, tex, sp, NodeSize, 1f, 6f);
                 }
 
                 dl.AddRect(sp, sp + NodeSize, borderCol, 6f, ImDrawFlags.None, isSelected || nodeHovered ? 2f : 1.5f);
 
                 // Status badges — centered on the bottom edge (half below). oGCD = lightning,
                 // combo-group = chain. When a node has both, lay them out as a centered pair.
-                if (!isTrigger && (node.IsOgcd || node.GroupId != null)) {
+                if (!isTrigger && (node.IsOgcd || node.GroupId != null || node.RetargetMode != 0)) {
                     ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
                     const float pad = 3f, gap = 4f;
                     var darkCol = Col(0.07f, 0.08f, 0.11f, 1f);
 
                     var boltStr = FontAwesomeIcon.Bolt.ToIconString();
                     var linkStr = FontAwesomeIcon.Link.ToIconString();
+                    var rtgStr  = FontAwesomeIcon.Crosshairs.ToIconString();
                     var boltGsz = ImGui.CalcTextSize(boltStr);
                     var linkGsz = ImGui.CalcTextSize(linkStr);
+                    var rtgGsz  = ImGui.CalcTextSize(rtgStr);
                     var boltW   = boltGsz.X + 2f * pad;
                     var linkW   = linkGsz.X + 2f * pad;
+                    var rtgW    = rtgGsz.X + 2f * pad;
 
                     var hasBolt  = node.IsOgcd;
                     var hasLink  = node.GroupId != null;
-                    var totalW   = (hasBolt ? boltW : 0f) + (hasLink ? linkW : 0f) + (hasBolt && hasLink ? gap : 0f);
+                    var hasRtg   = node.RetargetMode != 0;
+                    var nBadges  = (hasBolt ? 1 : 0) + (hasLink ? 1 : 0) + (hasRtg ? 1 : 0);
+                    var totalW   = (hasBolt ? boltW : 0f) + (hasLink ? linkW : 0f) + (hasRtg ? rtgW : 0f)
+                                 + (nBadges > 1 ? (nBadges - 1) * gap : 0f);
                     var x        = sp.X + (NodeSize.X - totalW) * 0.5f;
 
                     void Badge(string glyph, Vector2 gsz, float w, uint bg, float gdx) {
@@ -684,6 +785,7 @@ public class FlowEditorWindow : Window {
 
                     if (hasBolt) Badge(boltStr, boltGsz, boltW, Col(1f, 0.85f, 0.2f, 1f), 0f);
                     if (hasLink) Badge(linkStr, linkGsz, linkW, Col(1f, 0.7f, 0.2f, 1f), 0.5f);
+                    if (hasRtg)  Badge(rtgStr,  rtgGsz,  rtgW,  Col(0.4f, 0.85f, 1f, 1f), 0f);
                     ImGui.PopFont();
                 }
 
@@ -720,8 +822,8 @@ public class FlowEditorWindow : Window {
 
             // ── Context menu ──────────────────────────────────────────────
             if (ImGui.BeginPopup($"node_ctx_{node.Id}")) {
-                if (isCondition) {
-                    if (IconMenuItem(FontAwesomeIcon.Filter, "Edit Job Condition", Col(0.900f, 0.630f, 0.310f))) OpenConditionEdit(node.Id);
+                if (isGate) {
+                    if (IconMenuItem(FontAwesomeIcon.Filter, "Edit Condition", Col(0.900f, 0.630f, 0.310f))) OpenConditionEdit(node.Id);
                 } else if (isBranch) {
                     if (IconMenuItem(FontAwesomeIcon.List,   "Edit Outputs", Col(0.700f, 0.400f, 1.000f))) OpenBranchEdit(node.Id, node.OutputCount);
                 } else if (isNote) {
@@ -729,10 +831,20 @@ public class FlowEditorWindow : Window {
                 } else {
                     if (IconMenuItem(FontAwesomeIcon.Edit,   "Edit Action",
                             isTrigger ? Col(0.635f, 0.855f, 0.549f) : Col(0.455f, 0.765f, 1.000f))) OpenPicker(node.Id);
+                    if (!isTrigger && IconBeginMenu(FontAwesomeIcon.Crosshairs, "Retarget", Col(0.4f, 0.85f, 1f))) {
+                        string[] modes = ["None", "Self", "Lowest HP ally", "Target of target", "Lowest HP enemy", "Dead member"];
+                        for (var m = 0; m < modes.Length; m++)
+                            if (ImGui.MenuItem(modes[m], "", node.RetargetMode == m)) {
+                                node.RetargetMode = m;
+                                FlowExecutor.InvalidateFlow(_flow.Id);
+                                _config.Save();
+                            }
+                        ImGui.EndMenu();
+                    }
                 }
                 ImGui.Separator();
                 if (IconMenuItem(FontAwesomeIcon.Copy, "Copy", Col(0.45f, 0.80f, 0.85f))) {
-                    _clipboardNodes = [(node.Id, node.Type, 0f, 0f, node.ActionId, node.ActionLabel, node.IconId, node.OutputCount, node.ConditionField, node.ConditionCompareOp, (int)node.ConditionCompareVal, node.IsOgcd)];
+                    _clipboardNodes = [(node.Id, node.Clone(), 0f, 0f)];
                     _clipboardEdges = [];
                 }
                 if (IconMenuItem(FontAwesomeIcon.TrashAlt, "Delete Node", Col(1f, 0.40f, 0.40f)))  _pendingDeleteNodeId = node.Id;
@@ -753,22 +865,26 @@ public class FlowEditorWindow : Window {
         // ── Multi-selection context menu ──────────────────────────────────
         if (ImGui.BeginPopup("##multi_node_ctx")) {
             var selCount = _selectedNodeIds.Count;
-            if (IconMenuItem(FontAwesomeIcon.ObjectGroup, "Group as Combo", Col(1f, 0.70f, 0.20f))) {
-                var gid = Guid.NewGuid().ToString();
-                foreach (var n in _flow.Nodes)
-                    if (_selectedNodeIds.Contains(n.Id) && n.Type == NodeType.Action) n.GroupId = gid;
-                FlowExecutor.InvalidateFlow(_flow.Id);
-                _config.Save();
-                ImGui.CloseCurrentPopup();
+            // Grouping only applies to Action nodes and needs at least two to be meaningful.
+            var actionCount = _flow.Nodes.Count(n => _selectedNodeIds.Contains(n.Id) && n.Type == NodeType.Action);
+            if (actionCount >= 2) {
+                if (IconMenuItem(FontAwesomeIcon.ObjectGroup, "Group as Combo", Col(1f, 0.70f, 0.20f))) {
+                    var gid = Guid.NewGuid().ToString();
+                    foreach (var n in _flow.Nodes)
+                        if (_selectedNodeIds.Contains(n.Id) && n.Type == NodeType.Action) n.GroupId = gid;
+                    FlowExecutor.InvalidateFlow(_flow.Id);
+                    _config.Save();
+                    ImGui.CloseCurrentPopup();
+                }
+                if (IconMenuItem(FontAwesomeIcon.ObjectUngroup, "Ungroup", Col(1f, 0.70f, 0.20f))) {
+                    foreach (var n in _flow.Nodes)
+                        if (_selectedNodeIds.Contains(n.Id)) n.GroupId = null;
+                    FlowExecutor.InvalidateFlow(_flow.Id);
+                    _config.Save();
+                    ImGui.CloseCurrentPopup();
+                }
+                ImGui.Separator();
             }
-            if (IconMenuItem(FontAwesomeIcon.ObjectUngroup, "Ungroup", Col(1f, 0.70f, 0.20f))) {
-                foreach (var n in _flow.Nodes)
-                    if (_selectedNodeIds.Contains(n.Id)) n.GroupId = null;
-                FlowExecutor.InvalidateFlow(_flow.Id);
-                _config.Save();
-                ImGui.CloseCurrentPopup();
-            }
-            ImGui.Separator();
             if (IconMenuItem(FontAwesomeIcon.TrashAlt, $"Delete {selCount} nodes", Col(1f, 0.40f, 0.40f))) {
                 foreach (var id in _selectedNodeIds) {
                     _flow.Edges.RemoveAll(e => e.FromNodeId == id || e.ToNodeId == id);
@@ -792,7 +908,7 @@ public class FlowEditorWindow : Window {
                 _clipboardEdges = new();
                 foreach (var n in _flow.Nodes) {
                     if (!_selectedNodeIds.Contains(n.Id)) continue;
-                    _clipboardNodes.Add((n.Id, n.Type, n.X - cx, n.Y - cy, n.ActionId, n.ActionLabel, n.IconId, n.OutputCount, n.ConditionField, n.ConditionCompareOp, (int)n.ConditionCompareVal, n.IsOgcd));
+                    _clipboardNodes.Add((n.Id, n.Clone(), n.X - cx, n.Y - cy));
                 }
                 foreach (var e in _flow.Edges) {
                     if (_selectedNodeIds.Contains(e.FromNodeId) && _selectedNodeIds.Contains(e.ToNodeId))
@@ -863,28 +979,34 @@ public class FlowEditorWindow : Window {
             if (IconMenuItem(FontAwesomeIcon.Bolt,        "Add Trigger",   Col(0.635f, 0.855f, 0.549f))) AddNode(NodeType.Trigger);
             if (IconMenuItem(FontAwesomeIcon.Magic,       "Add Action",    Col(0.455f, 0.765f, 1.000f))) AddNode(NodeType.Action);
             if (IconMenuItem(FontAwesomeIcon.CodeBranch,  "Add Priority",  Col(0.700f, 0.400f, 1.000f))) AddNode(NodeType.Branch);
-            if (IconMenuItem(FontAwesomeIcon.Filter,      "Add Job Condition", Col(0.900f, 0.630f, 0.310f))) AddConditionNode();
+            var condCol = Col(0.900f, 0.630f, 0.310f);
+            if (IconBeginMenu(FontAwesomeIcon.Filter, "Add Condition", condCol)) {
+                if (IconMenuItem(FontAwesomeIcon.Filter,    "Job Gauge",  condCol)) AddGateNode(NodeType.Condition);
+                if (IconMenuItem(FontAwesomeIcon.Magic,     "Status",     condCol)) AddGateNode(NodeType.StatusCondition);
+                if (IconMenuItem(FontAwesomeIcon.Hourglass, "Cooldown",   condCol)) AddGateNode(NodeType.CooldownCondition);
+                if (IconMenuItem(FontAwesomeIcon.Crosshairs,"Target",     condCol)) AddGateNode(NodeType.TargetCondition);
+                if (IconMenuItem(FontAwesomeIcon.User,      "Player",     condCol)) AddGateNode(NodeType.PlayerCondition);
+                if (IconMenuItem(FontAwesomeIcon.Users,     "Party",      condCol)) AddGateNode(NodeType.PartyCondition);
+                ImGui.EndMenu();
+            }
             if (IconMenuItem(FontAwesomeIcon.StickyNote,  "Add Note",      Col(0.95f, 0.95f, 0.96f))) AddNoteNode();
             if (_clipboardNodes != null) {
                 ImGui.Separator();
                 if (IconMenuItem(FontAwesomeIcon.Paste, $"Paste ({_clipboardNodes.Count} nodes)", Col(0.55f, 0.85f, 0.50f))) {
-                    var pastePos = _contextMenuCanvasPos;
-                    var idMap    = new Dictionary<string, string>();
-                    var newNodes = new List<FlowNode>();
-                    foreach (var (origId, type, relX, relY, actionId, label, iconId, outputCount, condField, condOp, condVal, isOgcd) in _clipboardNodes) {
-                        var nn = new FlowNode {
-                            Type               = type,
-                            X                  = MathF.Round((pastePos.X + relX) / GridStep) * GridStep,
-                            Y                  = MathF.Round((pastePos.Y + relY) / GridStep) * GridStep,
-                            ActionId           = actionId,
-                            ActionLabel        = label,
-                            IconId             = iconId,
-                            OutputCount        = outputCount,
-                            ConditionField     = condField,
-                            ConditionCompareOp = condOp,
-                            ConditionCompareVal= condVal,
-                            IsOgcd             = isOgcd,
-                        };
+                    var pastePos  = _contextMenuCanvasPos;
+                    var idMap     = new Dictionary<string, string>();
+                    var groupMap  = new Dictionary<string, string>();
+                    var newNodes  = new List<FlowNode>();
+                    foreach (var (origId, tmpl, relX, relY) in _clipboardNodes) {
+                        var nn = tmpl.Clone();
+                        nn.Id = Guid.NewGuid().ToString();
+                        nn.X  = MathF.Round((pastePos.X + relX) / GridStep) * GridStep;
+                        nn.Y  = MathF.Round((pastePos.Y + relY) / GridStep) * GridStep;
+                        // Remap group ids so pasted nodes form their own group, not rejoin the original.
+                        if (nn.GroupId is { } gid) {
+                            if (!groupMap.TryGetValue(gid, out var ng)) { ng = Guid.NewGuid().ToString(); groupMap[gid] = ng; }
+                            nn.GroupId = ng;
+                        }
                         idMap[origId] = nn.Id;
                         newNodes.Add(nn);
                     }
@@ -934,9 +1056,9 @@ public class FlowEditorWindow : Window {
             OpenPicker(node.Id);
     }
 
-    private void AddConditionNode() {
+    private void AddGateNode(NodeType type) {
         var node = new FlowNode {
-            Type        = NodeType.Condition,
+            Type        = type,
             OutputCount = 2,
             X           = MathF.Round((_contextMenuCanvasPos.X - NodeSize.X * 0.5f) / GridStep) * GridStep,
             Y           = MathF.Round((_contextMenuCanvasPos.Y - NodeSize.Y * 0.5f) / GridStep) * GridStep,
@@ -944,6 +1066,27 @@ public class FlowEditorWindow : Window {
         _flow!.Nodes.Add(node);
         _config.Save();
         OpenConditionEdit(node.Id);
+    }
+
+    // Short category label used when a gate node has no check selected yet.
+    private static string GateCategory(NodeType t) => t switch {
+        NodeType.Condition         => "Job Condition",
+        NodeType.StatusCondition   => "Status",
+        NodeType.CooldownCondition => "Cooldown",
+        NodeType.TargetCondition   => "Target",
+        NodeType.PlayerCondition   => "Player",
+        NodeType.PartyCondition    => "Party",
+        _ => "Condition",
+    };
+
+    private static string GateNodeLabel(FlowNode n) {
+        var op  = ((CompareOp)n.ConditionCompareOp).ToLabel();
+        if (n.Type == NodeType.Condition)
+            return n.ConditionField != "" ? $"{n.ConditionField} {op} {n.ConditionCompareVal}" : "Job Condition";
+        var def = ConditionCatalog.Find(n.Type, n.CheckField);
+        if (def == null) return GateCategory(n.Type);
+        if (def.Bool) return n.ConditionCompareVal >= 1f ? def.Label : $"!{def.Label}";
+        return $"{def.Label} {op} {n.ConditionCompareVal:0.##}";
     }
 
     private void AddNoteNode() {
@@ -966,13 +1109,11 @@ public class FlowEditorWindow : Window {
     private void DrawNoteEdit() {
         if (_noteEditNodeId == null) return;
 
-        ImGui.SetNextWindowSizeConstraints(new Vector2(300, 180), new Vector2(600, 400));
-        ImGui.SetNextWindowSize(new Vector2(340, 200), ImGuiCond.FirstUseEver);
-        if (!ImGui.BeginPopupModal("Edit Note##noteedit", ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)) return;
+        if (!ImGui.BeginPopupModal("Edit Note##noteedit",
+                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.AlwaysAutoResize)) return;
 
         ImGui.TextDisabled("Note text");
-        ImGui.InputTextMultiline("##notetext", ref _noteEditText, 1024,
-            new Vector2(-1f, -ImGui.GetFrameHeightWithSpacing() - ImGui.GetStyle().ItemSpacing.Y));
+        ImGui.InputTextMultiline("##notetext", ref _noteEditText, 1024, new Vector2(CondW, 140f));
 
         var btnW = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
 
@@ -1011,13 +1152,12 @@ public class FlowEditorWindow : Window {
     private void DrawBranchEdit() {
         if (_branchEditNodeId == null) return;
 
-        ImGui.SetNextWindowSizeConstraints(new Vector2(260, 110), new Vector2(500, 200));
-        ImGui.SetNextWindowSize(new Vector2(280, 120), ImGuiCond.FirstUseEver);
-        if (!ImGui.BeginPopupModal("Priority Outputs##branchedit", ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)) return;
+        if (!ImGui.BeginPopupModal("Priority Outputs##branchedit",
+                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.AlwaysAutoResize)) return;
 
         ImGui.TextDisabled("Output count");
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(-1f);
+        ImGui.SetNextItemWidth(160f);
         ImGui.InputInt("##outcount", ref _branchEditCount);
         if (_branchEditCount < 2)  _branchEditCount = 2;
         if (_branchEditCount > 16) _branchEditCount = 16;
@@ -1230,36 +1370,54 @@ public class FlowEditorWindow : Window {
     }
 
     private void OpenConditionEdit(string nodeId) {
-        var node           = _flow!.Nodes.Find(n => n.Id == nodeId);
-        _condEditNodeId    = nodeId;
-        _condFieldSearch   = "";
-        _condFieldSelected = node?.ConditionField ?? "";
-        _condEditOp        = node?.ConditionCompareOp ?? 5;
-        _condEditVal       = (int)(node?.ConditionCompareVal ?? 1f);
+        var node             = _flow!.Nodes.Find(n => n.Id == nodeId);
+        _condEditNodeId      = nodeId;
+        _condEditType        = node?.Type ?? NodeType.Condition;
+        _condFieldSearch     = "";
+        _condEditOp          = node?.ConditionCompareOp ?? 5;
+        if (_condEditType == NodeType.Condition) {
+            _condFieldSelected = node?.ConditionField ?? "";
+            _condEditVal       = (int)(node?.ConditionCompareVal ?? 1f);
+        } else {
+            _condFieldSelected   = node?.CheckField ?? "";
+            _condEditValF        = node?.ConditionCompareVal ?? 1f;
+            _condParamId         = node?.CheckParamId ?? 0;
+            _condParamIcon       = node?.IconId ?? 0;
+            _condParam2          = node?.CheckParam2 ?? 0f;
+            _condTarget          = node?.CheckTarget ?? 0;
+            _condParamSearch     = "";
+            _condParamLastSearch = "\0";
+            _condParamLastKind   = CheckParamKind.None;
+            BuildJobCategorySet();   // job-scope the action list like the PvE picker tab
+        }
         _pendingOpenCondEdit = true;
     }
 
     private void DrawConditionEdit() {
         if (_condEditNodeId == null) return;
 
-        ImGui.SetNextWindowSizeConstraints(new Vector2(320, 300), new Vector2(600, 500));
-        ImGui.SetNextWindowSize(new Vector2(360, 380), ImGuiCond.FirstUseEver);
         if (!ImGui.BeginPopupModal("Edit Condition##condedit",
-                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)) return;
+                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.AlwaysAutoResize)) return;
 
+        if (_condEditType == NodeType.Condition) DrawJobConditionBody();
+        else                                     DrawParamConditionBody();
+
+        ImGui.EndPopup();
+    }
+
+    private void DrawJobConditionBody() {
         var fields = JobGaugeRegistry.GetFields(_flow?.Job ?? "");
 
         ImGui.TextDisabled("Field");
-        ImGui.SetNextItemWidth(-1f);
+        ImGui.SetNextItemWidth(CondW);
         ImGui.InputText("##cfsearch", ref _condFieldSearch, 64);
 
-        ImGui.BeginChild("##cffield", new Vector2(0, -110f), true);
+        ImGui.BeginChild("##cffield", new Vector2(CondW, 160f), true);
         if (fields != null) {
             foreach (var f in fields) {
                 if (_condFieldSearch.Length > 0
                     && !f.Name.Contains(_condFieldSearch, StringComparison.OrdinalIgnoreCase)) continue;
-                bool sel = f.Name == _condFieldSelected;
-                if (ImGui.Selectable(f.Name, sel))
+                if (ImGui.Selectable(f.Name, f.Name == _condFieldSelected))
                     _condFieldSelected = f.Name;
             }
         } else {
@@ -1268,19 +1426,131 @@ public class FlowEditorWindow : Window {
         ImGui.EndChild();
 
         ImGui.Spacing();
-
         string[] opLabels = ["==", "!=", "<", "≤", ">", "≥"];
         ImGui.TextDisabled("Compare");
-        ImGui.SetNextItemWidth(80f);
+        ImGui.SetNextItemWidth(70f);
         ImGui.Combo("##cfop", ref _condEditOp, opLabels, opLabels.Length);
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(-1f);
+        ImGui.SetNextItemWidth(CondW - 70f - ImGui.GetStyle().ItemSpacing.X);
         ImGui.DragInt("##cfval", ref _condEditVal, 1f);
-
         ImGui.Spacing();
 
-        var btnW = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+        DrawCondButtons(node => {
+            node.ConditionField      = _condFieldSelected;
+            node.ConditionCompareOp  = _condEditOp;
+            node.ConditionCompareVal = _condEditVal;
+        });
+    }
 
+    private void DrawParamConditionBody() {
+        var defs = ConditionCatalog.For(_condEditType);
+
+        ImGui.TextDisabled("Check");
+        ImGui.SetNextItemWidth(CondW);
+        ImGui.InputText("##cfsearch", ref _condFieldSearch, 64);
+
+        ImGui.BeginChild("##cffield", new Vector2(CondW, 120f), true);
+        if (defs != null)
+            foreach (var d in defs) {
+                if (_condFieldSearch.Length > 0
+                    && !d.Label.Contains(_condFieldSearch, StringComparison.OrdinalIgnoreCase)) continue;
+                if (ImGui.Selectable(d.Label, d.Key == _condFieldSelected))
+                    _condFieldSelected = d.Key;
+            }
+        ImGui.EndChild();
+
+        var def = ConditionCatalog.Find(_condEditType, _condFieldSelected);
+        ImGui.Spacing();
+
+        if (def != null) {
+            // Parameter widget (action / status picker, or a numeric value).
+            if (def.Param is CheckParamKind.ActionId or CheckParamKind.StatusId) {
+                var isStatus = def.Param == CheckParamKind.StatusId;
+                ImGui.TextDisabled(isStatus ? "Status" : "Action");
+                var cur = ResolveParamName(def.Param, _condParamId);
+                ImGui.TextUnformatted(_condParamId == 0 ? "(none)" : $"{cur} ({_condParamId})");
+
+                ImGui.SetNextItemWidth(CondW);
+                ImGui.InputTextWithHint("##cparam", isStatus ? "search status…" : "search action…", ref _condParamSearch, 64);
+                if (_condParamSearch != _condParamLastSearch || _condParamLastKind != def.Param) {
+                    _condParamLastSearch = _condParamSearch;
+                    _condParamLastKind   = def.Param;
+                    BuildCondParamResults(def.Param);
+                }
+                ImGui.BeginChild("##cparamlist", new Vector2(CondW, 180f), true);
+                foreach (var (id, name, icon, level) in _condParamResults) {
+                    var rs = ImGui.GetCursorPos();
+                    if (ImGui.Selectable($"##cp{id}", id == _condParamId, ImGuiSelectableFlags.None, new Vector2(0f, 36f)))
+                        { _condParamId = id; _condParamLabel = name; _condParamIcon = icon; }
+                    if (icon != 0) {
+                        var tex = Plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(icon))?.GetWrapOrDefault();
+                        if (tex != null) {
+                            // Status icons aren't square — fit into a 36px box preserving aspect ratio.
+                            var aspect = tex.Height > 0 ? (float)tex.Width / tex.Height : 1f;
+                            var sizeXY = aspect >= 1f ? new Vector2(36f, 36f / aspect) : new Vector2(36f * aspect, 36f);
+                            var off    = new Vector2((36f - sizeXY.X) * 0.5f, (36f - sizeXY.Y) * 0.5f);
+                            ImGui.SetCursorPos(rs + off);
+                            ImGui.Image(tex.Handle, sizeXY);
+                        }
+                    }
+                    ImGui.SetCursorPos(new Vector2(rs.X + (icon != 0 ? 40f : 0f), rs.Y + (36f - ImGui.GetTextLineHeight()) * 0.5f));
+                    ImGui.TextUnformatted(isStatus ? name : $"Lv{level}  {name}");
+                }
+                ImGui.EndChild();
+            } else if (def.Param is CheckParamKind.Range or CheckParamKind.Number) {
+                ImGui.TextDisabled(def.Param == CheckParamKind.Range ? "Range / threshold" : "Value");
+                ImGui.SetNextItemWidth(CondW);
+                int p2 = (int)MathF.Round(_condParam2);
+                ImGui.DragInt("##cparam2", ref p2, 1f);
+                _condParam2 = p2;
+            }
+
+            // Status/Target scope toggle.
+            if (def.HasTarget) {
+                ImGui.Spacing();
+                ImGui.TextDisabled("On");
+                ImGui.RadioButton("Player##ct", ref _condTarget, 0); ImGui.SameLine();
+                ImGui.RadioButton("Target##ct", ref _condTarget, 1);
+            }
+
+            // Comparison.
+            ImGui.Spacing();
+            if (def.Bool) {
+                ImGui.TextDisabled("State");
+                int isTrue = _condEditValF >= 1f ? 0 : 1;
+                string[] tf = ["is true", "is false"];
+                ImGui.SetNextItemWidth(CondW);
+                if (ImGui.Combo("##cbool", ref isTrue, tf, tf.Length)) { }
+                _condEditOp   = (int)CompareOp.Eq;
+                _condEditValF = isTrue == 0 ? 1f : 0f;
+            } else {
+                string[] opLabels = ["==", "!=", "<", "≤", ">", "≥"];
+                ImGui.TextDisabled("Compare");
+                ImGui.SetNextItemWidth(70f);
+                ImGui.Combo("##cfop", ref _condEditOp, opLabels, opLabels.Length);
+                ImGui.SameLine();
+                ImGui.SetNextItemWidth(CondW - 70f - ImGui.GetStyle().ItemSpacing.X);
+                int valI = (int)MathF.Round(_condEditValF);
+                ImGui.DragInt("##cfvalf", ref valI, 1f);
+                _condEditValF = valI;
+            }
+        }
+
+        ImGui.Spacing();
+        var iconParam = def is { Param: CheckParamKind.ActionId or CheckParamKind.StatusId };
+        DrawCondButtons(node => {
+            node.CheckField          = _condFieldSelected;
+            node.CheckParamId        = _condParamId;
+            node.CheckParam2         = _condParam2;
+            node.CheckTarget         = _condTarget;
+            node.ConditionCompareOp  = _condEditOp;
+            node.ConditionCompareVal = _condEditValF;
+            node.IconId              = iconParam ? _condParamIcon : 0;  // status/action icon for the node body
+        });
+    }
+
+    private void DrawCondButtons(Action<FlowNode> apply) {
+        var btnW = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
         ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.90f, 0.63f, 0.31f, 1f));
         ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(1.00f, 0.75f, 0.45f, 1f));
         ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.75f, 0.50f, 0.20f, 1f));
@@ -1289,9 +1559,7 @@ public class FlowEditorWindow : Window {
         if (ImGui.Button("OK", new Vector2(btnW, 0f))) {
             var node = _flow!.Nodes.Find(n => n.Id == _condEditNodeId);
             if (node != null) {
-                node.ConditionField      = _condFieldSelected;
-                node.ConditionCompareOp  = _condEditOp;
-                node.ConditionCompareVal = _condEditVal;
+                apply(node);
                 FlowExecutor.InvalidateFlow(_flow.Id);
                 _config.Save();
             }
@@ -1300,16 +1568,60 @@ public class FlowEditorWindow : Window {
         }
         ImGui.PopStyleVar();
         ImGui.PopStyleColor(4);
-
         ImGui.SameLine();
-
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
         if (ImGui.Button("Cancel", new Vector2(btnW, 0f))) {
             _condEditNodeId = null;
             ImGui.CloseCurrentPopup();
         }
         ImGui.PopStyleVar();
+    }
 
-        ImGui.EndPopup();
+    private void BuildCondParamResults(CheckParamKind kind) {
+        _condParamResults.Clear();
+        var q = _condParamSearch.Trim();
+        if (kind == CheckParamKind.ActionId) {
+            // Mirror the PvE tab of the action picker: same job-scoped content & filtering.
+            var sheet = Plugin.DataManager.GetExcelSheet<LuminaAction>();
+            if (sheet == null) return;
+            var jobScoped = _pickerJobCategoryIds != null;
+            foreach (var row in sheet) {
+                if (row.IsPvP) continue;                       // PvE tab only
+                var assignable = row.IsPlayerAction;
+                var catId      = row.ClassJobCategory.RowId;
+                if (!assignable) {
+                    if (!jobScoped || !_pickerJobExclusiveCategoryIds!.Contains(catId)) continue;
+                }
+                var name = row.Name.ToString();
+                if (name == "") continue;
+                if (q.Length > 0 && !name.Contains(q, StringComparison.OrdinalIgnoreCase)) continue;
+                if (jobScoped && assignable && !_pickerJobCategoryIds!.Contains(catId)) continue;
+                _condParamResults.Add((row.RowId, name, (uint)row.Icon, row.ClassJobLevel));
+                if (_condParamResults.Count >= 200) break;
+            }
+        } else if (kind == CheckParamKind.StatusId) {
+            var sheet = Plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Status>();
+            if (sheet == null) return;
+            foreach (var row in sheet) {
+                var name = row.Name.ToString();
+                if (name == "") continue;
+                if (q.Length > 0 && !name.Contains(q, StringComparison.OrdinalIgnoreCase)) continue;
+                _condParamResults.Add((row.RowId, name, row.Icon, 0));
+                if (_condParamResults.Count >= 200) break;
+            }
+        }
+    }
+
+    private static string ResolveParamName(CheckParamKind kind, uint id) {
+        if (id == 0) return "";
+        if (kind == CheckParamKind.ActionId) {
+            var row = Plugin.DataManager.GetExcelSheet<LuminaAction>()?.GetRowOrDefault(id);
+            return row?.Name.ToString() ?? "";
+        }
+        if (kind == CheckParamKind.StatusId) {
+            var row = Plugin.DataManager.GetExcelSheet<Lumina.Excel.Sheets.Status>()?.GetRowOrDefault(id);
+            return row?.Name.ToString() ?? "";
+        }
+        return "";
     }
 }

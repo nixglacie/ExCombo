@@ -67,6 +67,31 @@ internal sealed class ActionHook : IDisposable {
 
     private unsafe bool UseActionDetour(IntPtr actionManager, uint actionType, uint actionId, ulong targetId, uint a4, uint a5, uint a6, IntPtr a7) {
         if (a5 == 1) FlowExecutor.InQueueExecute = true;
+
+        // Retarget: if the action about to fire belongs to a flow Action node flagged with a built-in
+        // resolver, redirect the cast target without changing the player's hard target.
+        if (actionType == (uint)ActionType.Action) {
+            try {
+                foreach (var flow in _config.Flows) {
+                    if (!flow.Enabled) continue;
+                    foreach (var trigger in flow.Nodes) {
+                        if (trigger.Type != NodeType.Trigger) continue;
+                        var mode = FlowExecutor.GetRetargetForUsedAction(flow, trigger, actionId);
+                        if (mode == 0) continue;
+                        var resolved = Helpers.RetargetResolver.Resolve((RetargetMode)mode);
+                        if (resolved is { } tid && tid != 0) {
+                            Plugin.Log.Debug($"[ExCombo][Retarget] id={actionId} mode={(RetargetMode)mode} → {tid}");
+                            targetId = tid;
+                        }
+                        goto resolved_done;
+                    }
+                }
+                resolved_done: ;
+            } catch (Exception ex) {
+                Plugin.Log.Error(ex, "ActionHook retarget error");
+            }
+        }
+
         var result = _useHook.Original(actionManager, actionType, actionId, targetId, a4, a5, a6, a7);
         FlowExecutor.InQueueExecute = false;
         Plugin.Log.Debug($"[ExCombo][UseAction] id={actionId} a5={a5} result={result}");

@@ -6,9 +6,13 @@ using Dalamud.Interface.Textures.TextureWraps;
 namespace ExCombo.Helpers;
 
 public static class DrawHelpers {
-    public static void DrawIcon(ImDrawListPtr dl, IDalamudTextureWrap tex, Vector2 pos, Vector2 size, float opacity = 1f) {
-        dl.AddImage(tex.Handle, pos, pos + size, Vector2.Zero, Vector2.One,
-            ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 1f, opacity)));
+    public static void DrawIcon(ImDrawListPtr dl, IDalamudTextureWrap tex, Vector2 pos, Vector2 size,
+        float opacity = 1f, float rounding = 0f) {
+        var col = ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 1f, 1f, opacity));
+        if (rounding > 0f)
+            dl.AddImageRounded(tex.Handle, pos, pos + size, Vector2.Zero, Vector2.One, col, rounding);
+        else
+            dl.AddImage(tex.Handle, pos, pos + size, Vector2.Zero, Vector2.One, col);
     }
 
     public static void DrawText(ImDrawListPtr dl, Vector2 pos, string text, uint col, bool outline = false) {

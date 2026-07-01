@@ -498,9 +498,26 @@ public class MainWindow : Window {
             if (imported == null) { SetStatus("Nothing valid in clipboard."); return; }
             imported.Id   = Guid.NewGuid().ToString();
             imported.Name = imported.Name.EndsWith(" (imported)") ? imported.Name : imported.Name + " (imported)";
+
+            // Conflict = shares a trigger action with an already-enabled flow (both would replace the
+            // same hotbar action). Import it, but disabled, so the user picks which one wins.
+            var importedTriggers = new HashSet<uint>();
+            foreach (var n in imported.Nodes)
+                if (n.Type == NodeType.Trigger && n.ActionId != 0) importedTriggers.Add(n.ActionId);
+            bool conflict = false;
+            foreach (var f in _config.Flows) {
+                if (!f.Enabled) continue;
+                foreach (var n in f.Nodes)
+                    if (n.Type == NodeType.Trigger && n.ActionId != 0 && importedTriggers.Contains(n.ActionId)) { conflict = true; break; }
+                if (conflict) break;
+            }
+            if (conflict) imported.Enabled = false;
+
             _config.Flows.Add(imported);
             _config.Save();
-            SetStatus($"Imported \"{imported.Name}\"");
+            SetStatus(conflict
+                ? $"Imported \"{imported.Name}\" (disabled — conflicts with an enabled flow)"
+                : $"Imported \"{imported.Name}\"");
         } catch {
             SetStatus("Clipboard doesn't contain a valid flow.");
         }

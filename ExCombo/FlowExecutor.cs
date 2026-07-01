@@ -47,6 +47,7 @@ internal static class FlowExecutor {
 
     public static void Tick(List<ComboFlow> flows) {
         var now = Environment.TickCount64;
+        PlayerStateHelper.Update();   // frame-track movement & combat duration for condition checks
         foreach (var flow in flows)
             foreach (var trigger in flow.Nodes) {
                 if (trigger.Type != NodeType.Trigger) continue;
@@ -146,6 +147,18 @@ internal static class FlowExecutor {
         return flow.Nodes.Find(n => n.Id == state.NextActionId)?.ActionId ?? 0;
     }
 
+    // RetargetMode of the action about to fire for this trigger, if the used action matches the
+    // current chain node (by raw or adjusted id); 0 (None) otherwise.
+    public static int GetRetargetForUsedAction(ComboFlow flow, FlowNode trigger, uint usedActionId) {
+        if (!_states.TryGetValue(Key(flow, trigger), out var state) || state.NextActionId == "") return 0;
+        var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
+        if (node is not { Type: NodeType.Action } || node.RetargetMode == 0) return 0;
+        if (node.ActionId == usedActionId || Adjusted(node.ActionId) == usedActionId
+            || trigger.ActionId == usedActionId)
+            return node.RetargetMode;
+        return 0;
+    }
+
     public static void NotifyPressed(ComboFlow flow, FlowNode trigger) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
         if (state.PendingFire) return; // queue still pending — ignore stray press
@@ -233,7 +246,7 @@ internal static class FlowExecutor {
             if      (next == null || next.Type == NodeType.Trigger) FindInitialAction(flow, trigger, state);
             else if (next.Type == NodeType.Action)                  state.NextActionId = next.Id;
             else if (next.Type == NodeType.Branch)                  ResolveBranch(flow, state, next);
-            else if (next.Type == NodeType.Condition)               EnterCondition(flow, state, next);
+            else if (FlowNode.IsGate(next.Type))                    EnterCondition(flow, state, next);
         }
     }
 
@@ -241,25 +254,25 @@ internal static class FlowExecutor {
         var edge = flow.Edges.Find(e => e.FromNodeId == trigger.Id && e.FromPortIndex == 0);
         if (edge == null) { state.NextActionId = ""; return; }
         var next = flow.Nodes.Find(n => n.Id == edge.ToNodeId);
-        if      (next == null)                    state.NextActionId = "";
-        else if (next.Type == NodeType.Action)    state.NextActionId = next.Id;
-        else if (next.Type == NodeType.Branch)    ResolveBranch(flow, state, next);
-        else if (next.Type == NodeType.Condition) EnterCondition(flow, state, next);
-        else                                      state.NextActionId = "";
+        if      (next == null)                  state.NextActionId = "";
+        else if (next.Type == NodeType.Action)  state.NextActionId = next.Id;
+        else if (next.Type == NodeType.Branch)  ResolveBranch(flow, state, next);
+        else if (FlowNode.IsGate(next.Type))    EnterCondition(flow, state, next);
+        else                                    state.NextActionId = "";
     }
 
     // Re-evaluate a Branch or standalone Condition node from scratch.
     private static void ReResolve(ComboFlow flow, FlowRunState state, FlowNode node) {
-        if      (node.Type == NodeType.Branch)    ResolveBranch(flow, state, node);
-        else if (node.Type == NodeType.Condition) EnterCondition(flow, state, node);
+        if      (node.Type == NodeType.Branch) ResolveBranch(flow, state, node);
+        else if (FlowNode.IsGate(node.Type))   EnterCondition(flow, state, node);
     }
 
     // The action chain currently routed through a branch port (resolves nested Condition gates).
     private static List<FlowNode> GetActiveChain(ComboFlow flow, FlowNode routeNode, int port) {
-        if (routeNode.Type == NodeType.Condition) return GetPortChain(flow, routeNode.Id, port);
+        if (FlowNode.IsGate(routeNode.Type)) return GetPortChain(flow, routeNode.Id, port);
         var portEdge  = flow.Edges.Find(e => e.FromNodeId == routeNode.Id && e.FromPortIndex == port);
         var firstNode = portEdge != null ? flow.Nodes.Find(n => n.Id == portEdge.ToNodeId) : null;
-        return firstNode?.Type == NodeType.Condition
+        return firstNode != null && FlowNode.IsGate(firstNode.Type)
             ? GetPortChain(flow, firstNode.Id, 0)   // condition gate → its true-port chain
             : GetPortChain(flow, routeNode.Id, port);
     }
@@ -273,7 +286,7 @@ internal static class FlowExecutor {
         if (firstNode == null) return null;
 
         List<FlowNode> chain;
-        if (firstNode.Type == NodeType.Condition) {
+        if (FlowNode.IsGate(firstNode.Type)) {
             // Mid-chain: gate already passed at entry; let the started chain finish (e.g. the
             // Continuation that follows a Burst Strike which just spent the cartridge the gate reads).
             bool midChain = port == bs.ActivePort && bs.GetProgress(port) > 0;
@@ -408,13 +421,23 @@ internal static class FlowExecutor {
     }
 
     private static bool EvaluateCondition(string job, FlowNode condNode) {
-        var fields = JobGaugeRegistry.GetFields(job);
-        if (fields == null) return false;
-        foreach (var f in fields) {
-            if (f.Name != condNode.ConditionField) continue;
-            return ((CompareOp)condNode.ConditionCompareOp).Evaluate(f.Get(), condNode.ConditionCompareVal);
+        // Legacy job-gauge gate.
+        if (condNode.Type == NodeType.Condition) {
+            var fields = JobGaugeRegistry.GetFields(job);
+            if (fields == null) return false;
+            foreach (var f in fields) {
+                if (f.Name != condNode.ConditionField) continue;
+                return ((CompareOp)condNode.ConditionCompareOp).Evaluate(f.Get(), condNode.ConditionCompareVal);
+            }
+            return false;
         }
-        return false;
+
+        // Parameterized condition-family gate (Status/Cooldown/Target/Player/Party).
+        var def = ConditionCatalog.Find(condNode.Type, condNode.CheckField);
+        if (def == null) return false;
+        var ctx = new CheckCtx(condNode.CheckParamId, condNode.CheckParam2, condNode.CheckTarget == 1);
+        var value = def.Eval(ctx);
+        return ((CompareOp)condNode.ConditionCompareOp).Evaluate(value, condNode.ConditionCompareVal);
     }
 
     private static List<FlowNode> GetPortChain(ComboFlow flow, string branchNodeId, int portIndex) {

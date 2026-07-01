@@ -18,6 +18,11 @@ public sealed class Plugin : IDalamudPlugin {
     [PluginService] internal static IGameInteropProvider    GameInteropProvider { get; private set; } = null!;
     [PluginService] internal static IDataManager            DataManager         { get; private set; } = null!;
     [PluginService] internal static IJobGauges              JobGauges           { get; private set; } = null!;
+    [PluginService] internal static IClientState            ClientState         { get; private set; } = null!;
+    [PluginService] internal static ITargetManager          TargetManager       { get; private set; } = null!;
+    [PluginService] internal static IObjectTable            ObjectTable         { get; private set; } = null!;
+    [PluginService] internal static ICondition              Condition           { get; private set; } = null!;
+    [PluginService] internal static IPartyList              PartyList           { get; private set; } = null!;
 
     private readonly Configuration    _config;
     private readonly WindowSystem     _windowSystem = new("ExCombo");
@@ -66,6 +71,7 @@ public sealed class Plugin : IDalamudPlugin {
     }
 
     public void Dispose() {
+        _editorWindow.Dispose();
         _actionHook.Dispose();
         _dtrEntry.Remove();
         Framework.Update                       -= OnFrameworkUpdate;
