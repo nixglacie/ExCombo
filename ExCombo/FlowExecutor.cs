@@ -37,11 +37,10 @@ internal static class FlowExecutor {
 
     private static readonly Dictionary<string, FlowRunState> _states = new();
 
-    // User-tunable (Configuration); fall back to prior hard-coded defaults if config missing.
-    private static long ResetAfterMs => (Plugin.Config?.ChainResetSeconds ?? 15) * 1000L;
-    // Grace after a press before trusting the game's combo state (the game records the combo a frame late).
-    private static long ComboGraceMs => Plugin.Config?.ComboGraceMs ?? 500;
-    private static int  MaxWeaves    => Plugin.Config?.MaxWeavesPerGcd ?? 2;
+    // Effective tuning for the flow currently being processed (per-flow override ?? global ?? default).
+    private static long ResetAfterMs => Tuning.ResetMs;
+    private static long ComboGraceMs => Tuning.GraceMs;
+    private static int  MaxWeaves    => Tuning.MaxWeaves;
 
     // Set by ActionHook while inside UseAction(a5=1) original call.
     public static bool InQueueExecute = false;
@@ -62,7 +61,8 @@ internal static class FlowExecutor {
         if (ReplacementSuppressed()) return;   // master switch off or a safety gate → no progression
         var now = Environment.TickCount64;
         PlayerStateHelper.Update();   // frame-track movement & combat duration for condition checks
-        foreach (var flow in flows)
+        foreach (var flow in flows) {
+            Tuning.Load(flow);
             foreach (var trigger in flow.Nodes) {
                 if (trigger.Type != NodeType.Trigger) continue;
                 if (!_states.TryGetValue(Key(flow, trigger), out var s)) continue;
@@ -131,9 +131,11 @@ internal static class FlowExecutor {
                     }
                 }
             }
+        }
     }
 
     public static uint Resolve(ComboFlow flow, FlowNode trigger, uint triggerActionId) {
+        Tuning.Load(flow);
         var state = GetOrCreate(flow, trigger);
 
         if (state.NextActionId == "")
@@ -175,6 +177,7 @@ internal static class FlowExecutor {
 
     public static void NotifyPressed(ComboFlow flow, FlowNode trigger) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
+        Tuning.Load(flow);
         if (state.PendingFire) return; // queue still pending — ignore stray press
         state.LastPressedTick = Environment.TickCount64;
         var before = state.NextActionId;
@@ -194,6 +197,7 @@ internal static class FlowExecutor {
 
     public static void NotifyQueued(ComboFlow flow, FlowNode trigger, uint frozenReturn) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
+        Tuning.Load(flow);
         var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
         if (node != null && ActionHelper.IsOgcd(node.ActionId) && !OgcdOffer(state, node)) {
             // oGCD not weaveable (CD / proc down / window closed / weave limit) — skip it (and any
@@ -218,6 +222,7 @@ internal static class FlowExecutor {
 
     public static void NotifyFired(ComboFlow flow, FlowNode trigger) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
+        Tuning.Load(flow);
         if (!state.PendingFire) return;
         var before            = state.NextActionId;
         state.PendingFire     = false;
@@ -243,6 +248,7 @@ internal static class FlowExecutor {
         var list = new List<TriggerDbg>();
         foreach (var flow in flows) {
             if (!flow.Enabled) continue;
+            Tuning.Load(flow);
             foreach (var trigger in flow.Nodes) {
                 if (trigger.Type != NodeType.Trigger) continue;
                 var has  = _states.TryGetValue(Key(flow, trigger), out var s);
@@ -642,4 +648,23 @@ internal static class FlowExecutor {
     }
 
     private static string Key(ComboFlow flow, FlowNode trigger) => $"{flow.Id}:{trigger.Id}";
+}
+
+// Effective weave/combo tuning for the flow currently under evaluation. Loaded per-flow so a flow's
+// own overrides win over the global Configuration, which wins over the built-in defaults.
+internal static class Tuning {
+    public static int   MaxWeaves = 2;
+    public static float AnimLock  = 0.6f;
+    public static float Queue     = 0.5f;
+    public static int   GraceMs   = 500;
+    public static long  ResetMs   = 15_000;
+
+    public static void Load(ComboFlow f) {
+        var c = Plugin.Config;
+        MaxWeaves = f.MaxWeavesPerGcd   ?? c?.MaxWeavesPerGcd   ?? 2;
+        AnimLock  = f.AnimLockBudget    ?? c?.AnimLockBudget    ?? 0.6f;
+        Queue     = f.QueueBudget       ?? c?.QueueBudget       ?? 0.5f;
+        GraceMs   = f.ComboGraceMs      ?? c?.ComboGraceMs      ?? 500;
+        ResetMs   = (f.ChainResetSeconds ?? c?.ChainResetSeconds ?? 15) * 1000L;
+    }
 }

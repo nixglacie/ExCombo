@@ -14,4 +14,11 @@ public class ComboFlow {
     // Editor canvas pan offset, persisted so reopening restores the view.
     public float ViewX { get; set; }
     public float ViewY { get; set; }
+
+    // Per-flow tuning overrides. Null = inherit the global Configuration value.
+    public int?   MaxWeavesPerGcd   { get; set; }
+    public float? AnimLockBudget    { get; set; }
+    public float? QueueBudget       { get; set; }
+    public int?   ComboGraceMs      { get; set; }
+    public int?   ChainResetSeconds { get; set; }
 }

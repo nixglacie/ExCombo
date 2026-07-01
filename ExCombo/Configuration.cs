@@ -10,6 +10,11 @@ public enum LogLevel {
     Verbose = 1,   // full per-transition debug spam
 }
 
+public enum WireStyle {
+    Curved   = 0,   // Bézier
+    Straight = 1,   // direct line
+}
+
 [Serializable]
 public class Configuration : IPluginConfiguration {
     public int             Version      { get; set; } = 1;
@@ -37,6 +42,7 @@ public class Configuration : IPluginConfiguration {
     public bool  SnapToGrid       { get; set; } = true;
     public bool  ConfirmNodeDelete{ get; set; } = false;
     public int   UndoDepth        { get; set; } = 50;   // editor undo history size
+    public WireStyle WireStyle    { get; set; } = WireStyle.Curved;
 
     // ── Appearance ───────────────────────────────────────────────────────
     // Primary interactive accent (RGBA 0..1). Stored as float[] so Dalamud's serializer round-trips it.

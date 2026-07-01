@@ -109,6 +109,23 @@ public class FlowEditorWindow : Window {
     private static float Snap(float v) =>
         (Plugin.Config?.SnapToGrid ?? true) ? MathF.Round(v / GridStep) * GridStep : v;
 
+    // Draw an edge between two ports, honouring the WireStyle preference (curved Bézier or straight).
+    private static void DrawWire(ImDrawListPtr dl, Vector2 a, Vector2 b, uint col, float thick) {
+        if ((Plugin.Config?.WireStyle ?? WireStyle.Curved) == WireStyle.Straight)
+            dl.AddLine(a, b, col, thick);
+        else
+            dl.AddBezierCubic(a, a + new Vector2(60, 0), b - new Vector2(60, 0), b, col, thick);
+    }
+
+    // Midpoint of a wire for the delete button (t=0.5 on the Bézier, or the segment centre if straight).
+    private static Vector2 WireMidpoint(Vector2 a, Vector2 b) {
+        if ((Plugin.Config?.WireStyle ?? WireStyle.Curved) == WireStyle.Straight)
+            return (a + b) * 0.5f;
+        var cp1 = a + new Vector2(60, 0);
+        var cp2 = b - new Vector2(60, 0);
+        return 0.125f * a + 0.375f * cp1 + 0.375f * cp2 + 0.125f * b;
+    }
+
     private void DeleteNode(string nodeId) {
         if (_flow == null) return;
         _selectedNodeIds.Remove(nodeId);
@@ -364,7 +381,65 @@ public class FlowEditorWindow : Window {
         if (!canRedo) ImGui.EndDisabled();
         if (canRedo && ImGui.IsItemHovered()) ImGui.SetTooltip($"Redo ({_redo.Count})");
 
+        // Per-flow tuning overrides.
+        var slidersPos = canvasMin + new Vector2(8f + (icoSz.X + 4f) * 2f + 6f, 8f);
+        _flowCfgAnchor = slidersPos + new Vector2(0f, icoSz.Y + 6f);   // popup opens directly beneath
+        ImGui.SetCursorScreenPos(slidersPos);
+        if (ImGuiComponents.IconButton(FontAwesomeIcon.SlidersH, icoSz)) ImGui.OpenPopup("Flow settings##excFlowCfg");
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Flow tuning overrides");
+
         ImGui.SetCursorPos(start);
+        DrawFlowSettingsPopup();
+    }
+
+    // Per-flow tuning overrides: each row can override the global Configuration value or inherit it.
+    private Vector2 _flowCfgAnchor;
+
+    private void DrawFlowSettingsPopup() {
+        if (_flow == null) return;
+        ImGui.SetNextWindowPos(_flowCfgAnchor);   // pinned beneath the sliders button
+        if (!ImGui.BeginPopup("Flow settings##excFlowCfg", ImGuiWindowFlags.NoMove)) return;
+
+        ImGui.TextDisabled($"Overrides for \"{_flow.Name}\"");
+        ImGui.TextDisabled("Unchecked = inherit global setting.");
+        ImGui.Separator();
+        var c = Plugin.Config;
+        var f = _flow;
+
+        OverrideIntRow("Max weaves / GCD", f.MaxWeavesPerGcd, c?.MaxWeavesPerGcd ?? 2, 1, 3,
+            v => { f.MaxWeavesPerGcd = v; _config.Save(); });
+        OverrideFloatRow("Anim-lock budget", f.AnimLockBudget, c?.AnimLockBudget ?? 0.6f, 0.3f, 1.0f,
+            v => { f.AnimLockBudget = v; _config.Save(); });
+        OverrideFloatRow("Queue lead", f.QueueBudget, c?.QueueBudget ?? 0.5f, 0.2f, 1.0f,
+            v => { f.QueueBudget = v; _config.Save(); });
+        OverrideIntRow("Combo grace (ms)", f.ComboGraceMs, c?.ComboGraceMs ?? 500, 100, 1500,
+            v => { f.ComboGraceMs = v; _config.Save(); });
+        OverrideIntRow("Chain reset (s)", f.ChainResetSeconds, c?.ChainResetSeconds ?? 15, 3, 60,
+            v => { f.ChainResetSeconds = v; _config.Save(); });
+
+        ImGui.EndPopup();
+    }
+
+    private static void OverrideIntRow(string label, int? val, int global, int min, int max, Action<int?> set) {
+        bool on = val.HasValue;
+        if (ImGui.Checkbox($"##ov_{label}", ref on)) set(on ? val ?? global : null);
+        ImGui.SameLine();
+        if (!on) ImGui.BeginDisabled();
+        int v = val ?? global;
+        ImGui.SetNextItemWidth(150f);
+        if (ImGui.SliderInt(label, ref v, min, max) && on) set(v);
+        if (!on) ImGui.EndDisabled();
+    }
+
+    private static void OverrideFloatRow(string label, float? val, float global, float min, float max, Action<float?> set) {
+        bool on = val.HasValue;
+        if (ImGui.Checkbox($"##ov_{label}", ref on)) set(on ? val ?? global : null);
+        ImGui.SameLine();
+        if (!on) ImGui.BeginDisabled();
+        float v = val ?? global;
+        ImGui.SetNextItemWidth(150f);
+        if (ImGui.SliderFloat(label, ref v, min, max, "%.2f") && on) set(v);
+        if (!on) ImGui.EndDisabled();
     }
 
     private void Undo() {
@@ -460,16 +535,14 @@ public class FlowEditorWindow : Window {
                 p1 = canvasMin + _canvasOffset + new Vector2(fn.X + NodeSize.X, fn.Y + NodeSize.Y * 0.5f);
             }
             var p4  = canvasMin + _canvasOffset + new Vector2(tn.X, tn.Y + NodeHeight(tn) * 0.5f);
-            var cp1 = p1 + new Vector2(60, 0);
-            var cp2 = p4 - new Vector2(60, 0);
             // Gate (condition) edges are colored by branch: port 0 = true (green), port 1 = false (red).
             var edgeCol = FlowNode.IsGate(fn.Type)
                 ? (edge.FromPortIndex == 0 ? Col(0.30f, 0.80f, 0.30f, 0.9f) : Col(0.85f, 0.30f, 0.30f, 0.9f))
                 : Col(0.4f, 0.6f, 1f, 0.85f);
-            dl.AddBezierCubic(p1, cp1, cp2, p4, edgeCol, 2f);
+            DrawWire(dl, p1, p4, edgeCol, 2f);
 
             // ── Delete button at midpoint ─────────────────────────────────
-            var mid     = 0.125f*p1 + 0.375f*cp1 + 0.375f*cp2 + 0.125f*p4;
+            var mid     = WireMidpoint(p1, p4);
             const float Br = 7f;
             const float Bx = 3.5f;
             var btnHovered = _wireFromNodeId == null && _wireToNodeId == null && Vector2.Distance(mouse2, mid) < Br;
@@ -521,7 +594,7 @@ public class FlowEditorWindow : Window {
                 var wireCol = FlowNode.IsGate(wfn.Type)
                     ? (_wireFromPortIndex == 0 ? Col(0.30f, 0.80f, 0.30f, 0.6f) : Col(0.85f, 0.30f, 0.30f, 0.6f))
                     : Col(0.4f, 0.6f, 1f, 0.5f);
-                dl.AddBezierCubic(p1, p1 + new Vector2(60, 0), wireEnd - new Vector2(60, 0), wireEnd, wireCol, 2f);
+                DrawWire(dl, p1, wireEnd, wireCol, 2f);
             }
 
             if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) {
@@ -571,8 +644,7 @@ public class FlowEditorWindow : Window {
                 var start = hit is { } h && h.NodeId != _wireToNodeId
                     ? OutputPortPos(_flow.Nodes.Find(n => n.Id == h.NodeId)!, h.Port, canvasMin)
                     : mouse2;
-                dl.AddBezierCubic(start, start + new Vector2(60, 0), p4b - new Vector2(60, 0), p4b,
-                    Col(0.4f, 0.6f, 1f, 0.5f), 2f);
+                DrawWire(dl, start, p4b, Col(0.4f, 0.6f, 1f, 0.5f), 2f);
 
                 if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) {
                     if (hit is { } hh && hh.NodeId != _wireToNodeId) {

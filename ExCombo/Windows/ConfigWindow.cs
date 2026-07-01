@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 using System.Reflection;
+using System.Text.Json;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Windowing;
 
@@ -100,6 +101,50 @@ public class ConfigWindow : Window {
         bool combatOnly = _config.ReplaceOnlyInCombat;
         if (ImGui.Checkbox("Only replace in combat", ref combatOnly)) { _config.ReplaceOnlyInCombat = combatOnly; _config.Save(); }
         Help("Keep vanilla hotbars out of combat; replace only once you're fighting.");
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+        ImGui.Text("Data");
+        ImGui.Spacing();
+
+        if (ImGui.Button("Export all flows")) {
+            try { ImGui.SetClipboardText(JsonSerializer.Serialize(_config.Flows)); _dataMsg = "Copied all flows to clipboard."; }
+            catch { _dataMsg = "Export failed."; }
+        }
+        Help("Copy every flow to the clipboard as a JSON backup. Import individual flows from the main window.");
+        ImGui.SameLine();
+        if (ImGui.Button("Reset all settings")) {
+            ResetAllSettings();
+            _dataMsg = "All settings reset (flows kept).";
+        }
+        Help("Restore every setting (behaviour, safety, editor, theme, debug) to defaults. Your flows are not touched.");
+        if (_dataMsg != null) { ImGui.Spacing(); ImGui.TextDisabled(_dataMsg); }
+    }
+
+    private string? _dataMsg;
+
+    // Reset all tunables to defaults; leaves Flows (and Version) alone.
+    private void ResetAllSettings() {
+        _config.Enabled            = true;
+        _config.ShowDtrEntry       = true;
+        _config.MaxWeavesPerGcd    = 2;
+        _config.AnimLockBudget     = 0.6f;
+        _config.QueueBudget        = 0.5f;
+        _config.ComboGraceMs       = 500;
+        _config.ChainResetSeconds  = 15;
+        _config.DisableInPvP       = false;
+        _config.PauseWhenOccupied  = true;
+        _config.ReplaceOnlyInCombat= false;
+        _config.GridSize           = 32f;
+        _config.SnapToGrid         = true;
+        _config.ConfirmNodeDelete  = false;
+        _config.UndoDepth          = 50;
+        _config.WireStyle          = WireStyle.Curved;
+        _config.AccentColor        = new[] { 0.455f, 0.765f, 1.0f, 1f };
+        _config.LogLevel           = LogLevel.Verbose;
+        _config.ShowConditionState = false;
+        _config.Save();
     }
 
     // ── Theme ────────────────────────────────────────────────────────────
@@ -148,6 +193,13 @@ public class ConfigWindow : Window {
         if (ImGui.SliderInt("Undo history", ref undo, 5, 200)) { _config.UndoDepth = undo; _config.Save(); }
         Help("How many editor steps the undo button can walk back. Undo/redo buttons sit in the editor's top-left. Default 50.");
 
+        int wire = (int)_config.WireStyle;
+        ImGui.SetNextItemWidth(180f);
+        if (ImGui.Combo("Wire style", ref wire, "Curved\0Straight\0")) {
+            _config.WireStyle = (WireStyle)wire; _config.Save();
+        }
+        Help("How node connections are drawn: curved Bézier or straight lines.");
+
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
@@ -156,6 +208,7 @@ public class ConfigWindow : Window {
             _config.SnapToGrid        = true;
             _config.ConfirmNodeDelete = false;
             _config.UndoDepth         = 50;
+            _config.WireStyle         = WireStyle.Curved;
             _config.Save();
         }
     }
