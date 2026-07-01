@@ -262,6 +262,10 @@ public class FlowEditorWindow : Window {
         if (ImGui.GetScrollX() != 0f) ImGui.SetScrollX(0f);
         if (ImGui.GetScrollY() != 0f) ImGui.SetScrollY(0f);
 
+        // The window itself is flush (0 padding, set in PreDraw); popups & menus spawned from here
+        // get half the usual padding back.
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new Vector2(7f, 6f));
+
         var dl         = ImGui.GetWindowDrawList();
         var canvasMin  = ImGui.GetCursorScreenPos();
         var canvasSize = ImGui.GetContentRegionAvail();
@@ -1152,6 +1156,8 @@ public class FlowEditorWindow : Window {
         DrawBranchEdit();
         DrawConditionEdit();
         DrawNoteEdit();
+
+        ImGui.PopStyleVar();   // WindowPadding pushed at the top of Draw
     }
 
     private void AddNode(NodeType type) {
