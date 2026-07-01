@@ -16,6 +16,11 @@ internal sealed class ActionHook : IDisposable {
     private readonly Configuration                      _config;
     private readonly System.Collections.Generic.Dictionary<uint, uint> _lastIcon = new();
 
+    // Guards against re-entrancy: condition checks (e.g. Cooldown "ready") call game APIs that
+    // internally reach GetAdjustedActionId — the function this detour hooks. Without the guard the
+    // detour recurses into itself until the stack overflows.
+    [ThreadStatic] private static bool _inDetour;
+
     public ActionHook(Configuration config) {
         _config = config;
 
@@ -44,7 +49,11 @@ internal sealed class ActionHook : IDisposable {
 
     // Called every frame per hotbar slot, and inside UseAction(a5=1) for the queued action.
     private uint Detour(IntPtr actionManager, uint actionId) {
-        if (FlowExecutor.ReplacementSuppressed()) return _hook.Original(actionManager, actionId);   // off or safety-gated
+        // Re-entrant call (a condition check reached GetAdjustedActionId) or off/safety-gated →
+        // pass through untouched, no Resolve.
+        if (_inDetour || FlowExecutor.ReplacementSuppressed())
+            return _hook.Original(actionManager, actionId);
+        _inDetour = true;
         try {
             foreach (var flow in _config.Flows) {
                 if (!flow.Enabled) continue;
@@ -62,6 +71,8 @@ internal sealed class ActionHook : IDisposable {
             }
         } catch (Exception ex) {
             Plugin.Log.Error(ex, "ActionHook detour error");
+        } finally {
+            _inDetour = false;
         }
         return _hook.Original(actionManager, actionId);
     }

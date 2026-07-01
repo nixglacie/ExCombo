@@ -14,7 +14,7 @@ public readonly record struct CheckCtx(uint ParamId, float Param2, bool TargetIs
 // Bool=true ⇒ the check yields a true/false value (compared "is true / is false") and the editor
 // hides the numeric op/value widgets. HasTarget=true ⇒ offers a Player/Current-target scope toggle.
 public sealed record CheckDef(string Key, string Label, CheckParamKind Param, Func<CheckCtx, float> Eval,
-    bool Bool = false, bool HasTarget = false);
+    bool Bool = false, bool HasTarget = false, bool RequiresTarget = false);
 
 // Per node-type catalogs of parameterized checks (mirrors JobGaugeRegistry).
 internal static class ConditionCatalog {
@@ -34,15 +34,15 @@ internal static class ConditionCatalog {
 
     private static readonly List<CheckDef> _target = new() {
         new("PlayerHpPercent", "Player HP %",          CheckParamKind.None,  _ => TargetHelper.PlayerHpPercent()),
-        new("TargetHpPercent", "Target HP %",          CheckParamKind.None,  _ => TargetHelper.TargetHpPercent()),
-        new("TargetDistance",  "Target distance (y)",  CheckParamKind.None,  _ => TargetHelper.TargetDistance()),
-        new("InRange",         "Target in range (y)",  CheckParamKind.Range, c => B(TargetHelper.InRange(c.Param2)),         Bool: true),
-        new("InMeleeRange",    "In melee range",       CheckParamKind.None,  _ => B(TargetHelper.InMeleeRange()),           Bool: true),
-        new("TargetIsCasting", "Target casting (≥%)",  CheckParamKind.Range, c => B(TargetHelper.TargetIsCasting(c.Param2)),Bool: true),
-        new("EnemiesInRange",  "Enemies in range (y)", CheckParamKind.Range, c => TargetHelper.EnemiesInRange(c.Param2)),
-        new("OnFront",         "On target's front",    CheckParamKind.None,  _ => B(TargetHelper.OnFront()),                Bool: true),
-        new("OnFlank",         "On target's flank",    CheckParamKind.None,  _ => B(TargetHelper.OnFlank()),                Bool: true),
-        new("OnRear",          "On target's rear",     CheckParamKind.None,  _ => B(TargetHelper.OnRear()),                 Bool: true),
+        new("TargetHpPercent", "Target HP %",          CheckParamKind.None,  _ => TargetHelper.TargetHpPercent(),           RequiresTarget: true),
+        new("TargetDistance",  "Target distance (y)",  CheckParamKind.None,  _ => TargetHelper.TargetDistance(),            RequiresTarget: true),
+        new("InRange",         "Target in range (y)",  CheckParamKind.Range, c => B(TargetHelper.InRange(c.Param2)),         Bool: true,  RequiresTarget: true),
+        new("InMeleeRange",    "In melee range",       CheckParamKind.None,  _ => B(TargetHelper.InMeleeRange()),           Bool: true,  RequiresTarget: true),
+        new("TargetIsCasting", "Target casting (≥%)",  CheckParamKind.Range, c => B(TargetHelper.TargetIsCasting(c.Param2)),Bool: true,  RequiresTarget: true),
+        new("EnemiesInRange",  "Enemies in range (y)", CheckParamKind.Range, c => TargetHelper.EnemiesInRange(c.Param2),    RequiresTarget: true),
+        new("OnFront",         "On target's front",    CheckParamKind.None,  _ => B(TargetHelper.OnFront()),                Bool: true,  RequiresTarget: true),
+        new("OnFlank",         "On target's flank",    CheckParamKind.None,  _ => B(TargetHelper.OnFlank()),                Bool: true,  RequiresTarget: true),
+        new("OnRear",          "On target's rear",     CheckParamKind.None,  _ => B(TargetHelper.OnRear()),                 Bool: true,  RequiresTarget: true),
     };
 
     private static readonly List<CheckDef> _player = new() {

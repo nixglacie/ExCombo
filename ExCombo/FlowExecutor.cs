@@ -515,6 +515,10 @@ internal static class FlowExecutor {
         var def = ConditionCatalog.Find(condNode.Type, condNode.CheckField);
         if (def == null) return false;
         var ctx = new CheckCtx(condNode.CheckParamId, condNode.CheckParam2, condNode.CheckTarget == 1);
+        // Target-dependent checks fail closed with no target, so a negated form (e.g. "!in melee
+        // range") can't pass while untargeted regardless of CompareOp.
+        bool needsTarget = def.RequiresTarget || (def.HasTarget && ctx.TargetIsCurrent);
+        if (needsTarget && !TargetHelper.HasTarget()) return false;
         var value = def.Eval(ctx);
         return ((CompareOp)condNode.ConditionCompareOp).Evaluate(value, condNode.ConditionCompareVal);
     }

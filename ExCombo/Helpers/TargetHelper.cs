@@ -9,6 +9,9 @@ namespace ExCombo.Helpers;
 internal static class TargetHelper {
     private static IBattleChara? Target => Plugin.TargetManager.Target as IBattleChara;
 
+    // A valid battle target exists (soft/friendly/object targets don't count).
+    public static bool HasTarget() => Target != null;
+
     public static float PlayerHpPercent() {
         var p = Plugin.ObjectTable.LocalPlayer;
         return p is { MaxHp: > 0 } ? p.CurrentHp * 100f / p.MaxHp : 0f;

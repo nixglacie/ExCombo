@@ -770,8 +770,8 @@ public class FlowEditorWindow : Window {
             var isGate      = FlowNode.IsGate(node.Type);
             var isJobCond   = node.Type == NodeType.Condition;
             var isNote      = node.Type == NodeType.Note;
-            // Live flow inspector: draw per-type state rings only while in combat.
-            var inspect     = _config.ShowConditionState && Helpers.PlayerStateHelper.InCombat();
+            // Live flow inspector: draw per-type state rings whenever the toggle is on.
+            var inspect     = _config.ShowConditionState;
             var nodeH       = NodeHeight(node);
             var nodeW       = NodeWidthOf(node);
             var sp          = canvasMin + _canvasOffset + new Vector2(node.X, node.Y);
@@ -1183,7 +1183,7 @@ public class FlowEditorWindow : Window {
 
                     if (hasBolt) Badge(boltStr, boltGsz, boltW, Style.BadgeOgcdU32(), 0f);
                     if (hasLink) Badge(linkStr, linkGsz, linkW, Style.BadgeComboU32(), 0.5f);
-                    if (hasRtg)  Badge(rtgStr,  rtgGsz,  rtgW,  Style.BadgeRetargetU32(), 0f);
+                    if (hasRtg)  Badge(rtgStr,  rtgGsz,  rtgW,  Style.BadgeRetargetU32(), 1f);
                     ImGui.PopFont();
                 }
 

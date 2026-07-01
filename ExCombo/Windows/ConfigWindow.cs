@@ -320,7 +320,7 @@ public class ConfigWindow : Window {
         if (ImGui.Checkbox("Live flow inspector", ref inspect)) {
             _config.ShowConditionState = inspect; _config.Save();
         }
-        Help("In the flow editor during combat: gates tint green (true) / red (false); actions tint green (ready) / red (blocked) with the queued action highlighted; triggers and branches show their live state. Combat only.");
+        Help("In the flow editor: gates tint green (true) / red (false); actions tint green (ready) / red (blocked) with the queued action highlighted; triggers and branches show their live state. Live in and out of combat.");
 
         ImGui.Spacing();
         ImGui.Separator();
