@@ -15,11 +15,22 @@ public enum WireStyle {
     Straight = 1,   // direct line
 }
 
+// A named, reusable retarget priority chain. Modes are RetargetMode ints; applied to a node by
+// copying (snapshot) — editing/deleting a preset never affects nodes already using it.
+[Serializable]
+public class RetargetPreset {
+    public string    Name  { get; set; } = "";
+    public List<int> Modes { get; set; } = new();
+}
+
 [Serializable]
 public class Configuration : IPluginConfiguration {
     public int             Version      { get; set; } = 1;
     public List<ComboFlow> Flows        { get; set; } = new();
     public bool            ShowDtrEntry { get; set; } = true;
+
+    // User-defined reusable retarget priority chains (global, job-agnostic).
+    public List<RetargetPreset> RetargetPresets { get; set; } = new();
 
     // ── Master switch ────────────────────────────────────────────────────
     // When false, every flow reverts to vanilla icons without touching per-flow Enabled.

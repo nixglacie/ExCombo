@@ -19,6 +19,8 @@ internal static class FlowExecutor {
         public bool    PendingFire         = false;
         public uint    FrozenReturn        = 0;
         public long    LastPressedTick     = 0;
+        public float   LastSeenAnimLock    = 0f;
+        public bool    SawLockDecay        = true;   // true once the anim lock returned to idle since the last accounted cast
         public int     WeavedThisWindow    = 0;
         public float   LastGCDElapsed      = 0f;
         public string? LastTickSkipId      = null;
@@ -79,6 +81,16 @@ internal static class FlowExecutor {
                     ResetState(s);
                     continue;
                 }
+
+                // Keep the press rising-edge baseline valid while this trigger sits idle (no polls): the
+                // player animation lock is global and decays every frame, but LastSeenAnimLock is
+                // otherwise only sampled on this trigger's own press/queue/fire. Without this, a trigger
+                // idle through a gap keeps a stale-high baseline and the next real cast (same GCD lock
+                // magnitude) fails the rising-edge test → dropped advance (e.g. Hard Slash cast twice
+                // after a combo reset).
+                var alNow = WeaveHelper.CurrentAnimLock;
+                if (alNow <= AnimLockEpsilon) s.SawLockDecay = true;        // lock idle → next rise is a fresh cast
+                if (alNow < s.LastSeenAnimLock) s.LastSeenAnimLock = alNow; // follow the decay (low-water mark)
 
                 // Detect new GCD window (elapsed went backwards) → reset weave count
                 var gcdElapsed = WeaveHelper.GCDElapsed;
@@ -169,22 +181,48 @@ internal static class FlowExecutor {
         return flow.Nodes.Find(n => n.Id == state.NextActionId)?.ActionId ?? 0;
     }
 
-    // RetargetMode of the action about to fire for this trigger, if the used action matches the
-    // current chain node (by raw or adjusted id); 0 (None) otherwise.
-    public static int GetRetargetForUsedAction(ComboFlow flow, FlowNode trigger, uint usedActionId) {
-        if (!_states.TryGetValue(Key(flow, trigger), out var state) || state.NextActionId == "") return 0;
+    // Resolved retarget object id for the action about to fire for this trigger, if the used action
+    // matches the current chain node (by raw or adjusted id) and the node has a retarget chain that
+    // yields a valid, in-range candidate; null otherwise (leave the cast target unchanged).
+    public static ulong? ResolveRetargetTarget(ComboFlow flow, FlowNode trigger, uint usedActionId) {
+        if (!_states.TryGetValue(Key(flow, trigger), out var state) || state.NextActionId == "") return null;
         var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
-        if (node is not { Type: NodeType.Action } || node.RetargetMode == 0) return 0;
+        if (node is not { Type: NodeType.Action }) return null;
+        if (node.RetargetPriority.Count == 0 && node.RetargetMode == 0) return null;
         if (node.ActionId == usedActionId || Adjusted(node.ActionId) == usedActionId
             || trigger.ActionId == usedActionId)
-            return node.RetargetMode;
-        return 0;
+            return RetargetResolver.ResolvePriority(node, usedActionId);
+        return null;
     }
 
     public static void NotifyPressed(ComboFlow flow, FlowNode trigger) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
         Tuning.Load(flow);
         if (state.PendingFire) return; // queue still pending — ignore stray press
+
+        // Held hotbar buttons auto-repeat UseAction(a5=0) many times per GCD; only a genuine cast
+        // should advance the chain. A real cast raises the player's animation lock (then it decays),
+        // so advance only on a rising edge — held-repeat polls (flat/decaying lock) are ignored,
+        // leaving the icon frozen on the current step.
+        //
+        // The game writes a cast's animation lock a few frames AFTER UseAction returns, so a lock we
+        // already accounted for (a queued Fired, or the previous press) applies late and looks like a
+        // fresh rise on the next held poll — double-advancing the chain one step ahead of the game
+        // combo. Gate the rising edge on an intervening decay to idle: only accept a rise once the lock
+        // has returned to ~0 since the last accounted cast.
+        var al = WeaveHelper.CurrentAnimLock;
+        if (al <= AnimLockEpsilon) state.SawLockDecay = true;             // lock idle → a future rise is a fresh cast
+        if (al <= state.LastSeenAnimLock + AnimLockEpsilon) {             // not a rise
+            state.LastSeenAnimLock = al;
+            return;
+        }
+        if (!state.SawLockDecay) {                                        // rise with no intervening decay = a late-applied accounted cast
+            state.LastSeenAnimLock = al;
+            return;
+        }
+        state.SawLockDecay     = false;
+        state.LastSeenAnimLock = al;
+
         state.LastPressedTick = Environment.TickCount64;
         var before = state.NextActionId;
         TrackWeaveCount(flow, state);
@@ -197,6 +235,7 @@ internal static class FlowExecutor {
         if (!state.PendingFire) return;
         state.PendingFire  = false;
         state.FrozenReturn = 0;
+        state.LastSeenAnimLock = WeaveHelper.CurrentAnimLock;
         // Don't advance — action didn't fire; player should retry
         Plugin.LogDebug($"[ExCombo][QueueFail] trigger={trigger.ActionId} unfrozen, retry same action");
     }
@@ -204,6 +243,7 @@ internal static class FlowExecutor {
     public static void NotifyQueued(ComboFlow flow, FlowNode trigger, uint frozenReturn) {
         if (!_states.TryGetValue(Key(flow, trigger), out var state)) return;
         Tuning.Load(flow);
+        state.LastSeenAnimLock = WeaveHelper.CurrentAnimLock;   // queue doesn't advance; keep the edge tracker in sync
         var node = flow.Nodes.Find(n => n.Id == state.NextActionId);
         if (node != null && ActionHelper.IsOgcd(node.ActionId) && !OgcdOffer(state, node)) {
             // oGCD not weaveable (CD / proc down / window closed / weave limit) — skip it (and any
@@ -223,6 +263,7 @@ internal static class FlowExecutor {
         state.PendingFire     = true;
         state.FrozenReturn    = frozenReturn;
         state.LastPressedTick = Environment.TickCount64;
+        state.SawLockDecay    = false;   // post-queue held polls must not press-advance until the lock decays
         Plugin.LogDebug($"[ExCombo][Queue] trigger={trigger.ActionId} frozen={frozenReturn} next={state.NextActionId}");
     }
 
@@ -234,6 +275,8 @@ internal static class FlowExecutor {
         state.PendingFire     = false;
         state.FrozenReturn    = 0;
         state.LastPressedTick = Environment.TickCount64;
+        state.LastSeenAnimLock = WeaveHelper.CurrentAnimLock;   // this cast's lock; a following held a5=0 can't re-advance it
+        state.SawLockDecay     = false;                         // this cast's lock applies late; ignore its rise on the next held poll
         TrackWeaveCount(flow, state);
         AdvanceState(flow, trigger, state);
         Plugin.LogDebug($"[ExCombo][Fired] trigger={trigger.ActionId} {before}→{state.NextActionId}");
@@ -243,6 +286,37 @@ internal static class FlowExecutor {
 
     // Live evaluation of a gate node against current game state. Used by the editor to tint gates.
     public static bool EvalGate(ComboFlow flow, FlowNode node) => EvaluateCondition(flow.Job, node);
+
+    // True if a path from a trigger to this node is open under current game state
+    // (every gate crossed evaluates live on the port its edge leaves). Used by the editor so an
+    // action gated off by a false upstream condition doesn't read as usable.
+    public static bool LiveReachable(ComboFlow flow, FlowNode node)
+        => LiveReachable(flow, node, new HashSet<string>());
+
+    private static bool LiveReachable(ComboFlow flow, FlowNode node, HashSet<string> seen) {
+        if (node.Type == NodeType.Trigger) return true;
+        // The live queued step is on the active path at any chain depth (also gets the gold pulse).
+        if (IsQueuedAction(flow, node.Id)) return true;
+        if (!seen.Add(node.Id)) return false;                 // cycle guard
+        var any = false;
+        foreach (var e in flow.Edges) {
+            if (e.ToNodeId != node.Id) continue;
+            var from = flow.Nodes.Find(n => n.Id == e.FromNodeId);
+            if (from == null) continue;
+            // Chain predecessor: a later combo step isn't castable until the run advances to it, so an
+            // Action→Action edge does not grant reachability — only being the queued step does (above).
+            if (from.Type == NodeType.Action) continue;
+            if (FlowNode.IsGate(from.Type)) {
+                var pass = EvaluateCondition(flow.Job, from);   // port 0 = true, port 1 = false
+                if (e.FromPortIndex == 0 ? !pass : pass) continue;
+            }
+            // Branch / Trigger: pass-through (branch port selection is priority/run-state, out of
+            // scope here — only Condition gates are propagated).
+            if (LiveReachable(flow, from, seen)) { any = true; break; }
+        }
+        seen.Remove(node.Id);
+        return any;
+    }
 
     // ── Live inspector queries (read-only views over private _states) ────────
     // Keys are "{flow.Id}:{trigger.Id}", so a flow's states are those whose key starts flow.Id.
@@ -619,6 +693,9 @@ internal static class FlowExecutor {
     // animation-lock gap after casting (a GCD or a prior weave) without over-showing on-CD oGCDs.
     private const float RecastReadyTolerance = 0.7f;
 
+    // Minimum rise in the player's animation lock that counts as a new cast (vs. held-repeat noise).
+    private const float AnimLockEpsilon = 0.01f;
+
     // Usable for weaving: resolves the evolved (adjusted) id, and shows the oGCD through animation
     // locks while still hiding it when genuinely on cooldown or short on resources.
     //
@@ -661,6 +738,8 @@ internal static class FlowExecutor {
         s.PendingFire        = false;
         s.FrozenReturn       = 0;
         s.LastPressedTick    = 0;
+        s.LastSeenAnimLock   = 0f;
+        s.SawLockDecay       = true;
         s.WeavedThisWindow   = 0;
         s.LastGCDElapsed     = 0f;
         s.LastTickSkipId     = null;

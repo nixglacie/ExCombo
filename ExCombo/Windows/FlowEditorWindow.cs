@@ -36,7 +36,14 @@ public class FlowEditorWindow : Window {
     private string? _dropSrcNodeId;       // dangling source (connect new node as its target)
     private int     _dropSrcPort;
     private string? _dropDstNodeId;       // dangling target (connect new node as its source)
-    private string? _pickerNodeId;
+    private string? _editNodeId;          // node being edited in the merged Action/Retarget modal
+    private int     _editActiveTab;       // 0 = Action, 1 = Retarget
+    // Staged edits — applied to the node only on OK, discarded on Cancel.
+    private uint      _editActionId;
+    private string    _editActionLabel = "";
+    private uint      _editIconId;
+    private bool      _editIsOgcd;
+    private List<int> _editRetarget = new();
     private string  _pickerSearch     = "";
     private string  _pickerLastSearch = "\0";
     private readonly List<(uint Id, string Name, uint Icon, byte Level, bool IsPvp)> _pickerResults = new();
@@ -77,7 +84,7 @@ public class FlowEditorWindow : Window {
     private string? _resizingNoteId;
 
     // Deferred popup opens — set inside popup contexts, opened outside
-    private bool _pendingOpenPicker;
+    private bool _pendingOpenNodeEdit;
     private bool _pendingOpenBranchEdit;
     private bool _pendingOpenCondEdit;
     private bool _pendingOpenNoteEdit;
@@ -115,6 +122,35 @@ public class FlowEditorWindow : Window {
             dl.AddLine(a, b, col, thick);
         else
             dl.AddBezierCubic(a, a + new Vector2(60, 0), b - new Vector2(60, 0), b, col, thick);
+    }
+
+    // Live-inspector edge color: dim grey if the source port isn't the taken branch, otherwise
+    // the downstream target node's state (green usable / red on-cd / grey gated / gold queued).
+    private static uint InspectEdgeColor(ComboFlow flow, FlowNode fn, FlowNode tn, FlowEdge edge) {
+        bool sourceOpen =
+            fn.Type == NodeType.Trigger ? FlowExecutor.TriggerActive(flow, fn.Id)
+          : FlowNode.IsGate(fn.Type)    ? (FlowExecutor.EvalGate(flow, fn) ? edge.FromPortIndex == 0 : edge.FromPortIndex == 1)
+          : fn.Type == NodeType.Branch  ? FlowExecutor.ActiveBranchPort(flow, fn.Id) == edge.FromPortIndex
+          : true; // action chain step
+        if (!sourceOpen) return Col(0.45f, 0.45f, 0.45f, 0.5f);
+
+        if (tn.Type == NodeType.Action) {
+            if (FlowExecutor.IsQueuedAction(flow, tn.Id)) {
+                var pulse = 0.65f + 0.35f * MathF.Sin((float)ImGui.GetTime() * 4f);
+                return Col(1f, 0.85f, 0.25f, pulse);                 // queued next → gold pulse
+            }
+            var reachable = FlowExecutor.LiveReachable(flow, tn);
+            var ready     = Helpers.CooldownHelper.Ready(tn.ActionId);
+            return !reachable ? Col(0.45f, 0.45f, 0.45f, 0.55f)      // gated off → grey
+                 : ready      ? Col(0.30f, 0.85f, 0.30f, 0.9f)       // usable → green
+                              : Col(0.85f, 0.30f, 0.30f, 0.9f);      // on cd → red
+        }
+        if (FlowNode.IsGate(tn.Type))
+            return FlowExecutor.EvalGate(flow, tn) ? Col(0.30f, 0.85f, 0.30f, 0.9f) : Col(0.85f, 0.30f, 0.30f, 0.9f);
+        if (tn.Type == NodeType.Branch)
+            return FlowExecutor.ActiveBranchPort(flow, tn.Id) >= 0 ? Col(0.30f, 0.85f, 0.30f, 0.9f) : Col(0.45f, 0.45f, 0.45f, 0.55f);
+
+        return Col(0.4f, 0.6f, 1f, 0.85f); // fallback (e.g. Note) — static blue
     }
 
     // Midpoint of a wire for the delete button (t=0.5 on the Bézier, or the segment centre if straight).
@@ -539,6 +575,10 @@ public class FlowEditorWindow : Window {
 
         var mouse2 = ImGui.GetMousePos();
 
+        // Live flow inspector: draw per-type state rings/edges whenever the toggle is on and a local
+        // player exists (evaluating conditions during login/zoning can crash on unloaded memory).
+        var inspect = _config.ShowConditionState && Plugin.ObjectTable.LocalPlayer != null;
+
         // ── Edges ─────────────────────────────────────────────────────────
         FlowEdge? edgeToDelete = null;
         foreach (var edge in _flow.Edges) {
@@ -555,10 +595,18 @@ public class FlowEditorWindow : Window {
             }
             var p4  = canvasMin + _canvasOffset + new Vector2(tn.X, tn.Y + NodeHeight(tn) * 0.5f);
             // Gate (condition) edges are colored by branch: port 0 = true (green), port 1 = false (red).
-            var edgeCol = FlowNode.IsGate(fn.Type)
-                ? (edge.FromPortIndex == 0 ? Col(0.30f, 0.80f, 0.30f, 0.9f) : Col(0.85f, 0.30f, 0.30f, 0.9f))
-                : Col(0.4f, 0.6f, 1f, 0.85f);
-            DrawWire(dl, p1, p4, edgeCol, 2f);
+            // When the inspector is on, edges instead carry the downstream node's live state.
+            uint  edgeCol;
+            float thick = 2f;
+            if (inspect) {
+                edgeCol = InspectEdgeColor(_flow, fn, tn, edge);
+                if (tn.Type == NodeType.Action && FlowExecutor.IsQueuedAction(_flow, tn.Id)) thick = 2.75f; // match node gold pulse weight
+            } else {
+                edgeCol = FlowNode.IsGate(fn.Type)
+                    ? (edge.FromPortIndex == 0 ? Col(0.30f, 0.80f, 0.30f, 0.9f) : Col(0.85f, 0.30f, 0.30f, 0.9f))
+                    : Col(0.4f, 0.6f, 1f, 0.85f);
+            }
+            DrawWire(dl, p1, p4, edgeCol, thick);
 
             // ── Delete button at midpoint ─────────────────────────────────
             var mid     = WireMidpoint(p1, p4);
@@ -770,9 +818,6 @@ public class FlowEditorWindow : Window {
             var isGate      = FlowNode.IsGate(node.Type);
             var isJobCond   = node.Type == NodeType.Condition;
             var isNote      = node.Type == NodeType.Note;
-            // Live flow inspector: draw per-type state rings whenever the toggle is on and a local
-            // player exists (evaluating conditions during login/zoning can crash on unloaded memory).
-            var inspect     = _config.ShowConditionState && Plugin.ObjectTable.LocalPlayer != null;
             var nodeH       = NodeHeight(node);
             var nodeW       = NodeWidthOf(node);
             var sp          = canvasMin + _canvasOffset + new Vector2(node.X, node.Y);
@@ -953,8 +998,8 @@ public class FlowEditorWindow : Window {
                 // Live flow inspector: which output port is currently driving the rotation (-1 = none).
                 var inspActivePort = inspect ? FlowExecutor.ActiveBranchPort(_flow!, node.Id) : -1;
                 if (inspActivePort >= 0)
-                    dl.AddRect(sp - new Vector2(3f, 3f), sp + new Vector2(NodeSize.X + 3f, nodeH + 3f),
-                        Col(0.30f, 0.85f, 0.30f, 0.6f), 8f, ImDrawFlags.None, 2f);
+                    DrawHelpers.DrawDashedRect(dl, sp - new Vector2(5f, 5f), sp + new Vector2(NodeSize.X + 5f, nodeH + 5f),
+                        Col(0.30f, 0.85f, 0.30f, 0.6f), 2f, 6f, 4f, 6f);
 
                 var label      = "Priority";
                 var labelWidth = ImGui.CalcTextSize(label).X;
@@ -1063,8 +1108,8 @@ public class FlowEditorWindow : Window {
                 if (inspect) {
                     bool pass = FlowExecutor.EvalGate(_flow!, node);
                     var tint  = pass ? Col(0.30f, 0.85f, 0.30f, 0.9f) : Col(0.85f, 0.30f, 0.30f, 0.9f);
-                    dl.AddRect(sp - new Vector2(3f, 3f), sp + new Vector2(NodeSize.X + 3f, nodeH + 3f),
-                        tint, 8f, ImDrawFlags.None, 2f);
+                    DrawHelpers.DrawDashedRect(dl, sp - new Vector2(5f, 5f), sp + new Vector2(NodeSize.X + 5f, nodeH + 5f),
+                        tint, 2f, 6f, 4f, 6f);
                 }
 
                 var condLabel      = GateNodeLabel(node);
@@ -1133,24 +1178,29 @@ public class FlowEditorWindow : Window {
                 if (inspect) {
                     if (isTrigger) {
                         if (FlowExecutor.TriggerActive(_flow!, node.Id))
-                            dl.AddRect(sp - new Vector2(3f, 3f), sp + NodeSize + new Vector2(3f, 3f),
-                                Col(0.30f, 0.85f, 0.30f, 0.9f), 8f, ImDrawFlags.None, 2f);
+                            DrawHelpers.DrawDashedRect(dl, sp - new Vector2(5f, 5f), sp + NodeSize + new Vector2(5f, 5f),
+                                Col(0.30f, 0.85f, 0.30f, 0.9f), 2f, 6f, 4f, 6f);
                     } else {
-                        var ready = Helpers.CooldownHelper.Ready(node.ActionId);
-                        var tint  = ready ? Col(0.30f, 0.85f, 0.30f, 0.9f) : Col(0.85f, 0.30f, 0.30f, 0.9f);
-                        dl.AddRect(sp - new Vector2(3f, 3f), sp + NodeSize + new Vector2(3f, 3f),
-                            tint, 8f, ImDrawFlags.None, 2f);
+                        var reachable = FlowExecutor.LiveReachable(_flow!, node);
+                        var ready     = Helpers.CooldownHelper.Ready(node.ActionId);
+                        var tint = !reachable ? Col(0.45f, 0.45f, 0.45f, 0.6f)   // grey/dim = gated off (upstream cond false)
+                                 : ready      ? Col(0.30f, 0.85f, 0.30f, 0.9f)   // green     = reachable + usable
+                                              : Col(0.85f, 0.30f, 0.30f, 0.9f);  // red       = reachable but on CD/blocked
                         if (FlowExecutor.IsQueuedAction(_flow!, node.Id)) {
+                            // Queued next → solid gold pulse replaces the dashed status ring.
                             var pulse = 0.65f + 0.35f * MathF.Sin((float)ImGui.GetTime() * 4f);
                             dl.AddRect(sp - new Vector2(5f, 5f), sp + NodeSize + new Vector2(5f, 5f),
-                                Col(1f, 0.85f, 0.25f, pulse), 9f, ImDrawFlags.None, 2.5f);
+                                Col(1f, 0.85f, 0.25f, pulse), 6f, ImDrawFlags.None, 2f);
+                        } else {
+                            DrawHelpers.DrawDashedRect(dl, sp - new Vector2(5f, 5f), sp + NodeSize + new Vector2(5f, 5f),
+                                tint, 2f, 6f, 4f, 6f);
                         }
                     }
                 }
 
                 // Status badges — centered on the bottom edge (half below). oGCD = lightning,
                 // combo-group = chain. When a node has both, lay them out as a centered pair.
-                if (!isTrigger && (node.IsOgcd || node.GroupId != null || node.RetargetMode != 0)) {
+                if (!isTrigger && (node.IsOgcd || node.GroupId != null || node.RetargetPriority.Count > 0 || node.RetargetMode != 0)) {
                     ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
                     const float pad = 3f, gap = 4f;
                     var darkCol = Col(0.07f, 0.08f, 0.11f, 1f);
@@ -1167,7 +1217,7 @@ public class FlowEditorWindow : Window {
 
                     var hasBolt  = node.IsOgcd;
                     var hasLink  = node.GroupId != null;
-                    var hasRtg   = node.RetargetMode != 0;
+                    var hasRtg   = node.RetargetPriority.Count > 0 || node.RetargetMode != 0;
                     var nBadges  = (hasBolt ? 1 : 0) + (hasLink ? 1 : 0) + (hasRtg ? 1 : 0);
                     var totalW   = (hasBolt ? boltW : 0f) + (hasLink ? linkW : 0f) + (hasRtg ? rtgW : 0f)
                                  + (nBadges > 1 ? (nBadges - 1) * gap : 0f);
@@ -1232,16 +1282,8 @@ public class FlowEditorWindow : Window {
                 } else {
                     if (IconMenuItem(FontAwesomeIcon.Edit,   "Edit Action",
                             Style.NodeColU32(node.Type))) OpenPicker(node.Id);
-                    if (!isTrigger && IconBeginMenu(FontAwesomeIcon.Crosshairs, "Retarget", Col(0.4f, 0.85f, 1f))) {
-                        string[] modes = ["None", "Self", "Lowest HP ally", "Target of target", "Lowest HP enemy", "Dead member"];
-                        for (var m = 0; m < modes.Length; m++)
-                            if (ImGui.MenuItem(modes[m], "", node.RetargetMode == m)) {
-                                node.RetargetMode = m;
-                                FlowExecutor.InvalidateFlow(_flow.Id);
-                                Commit();
-                            }
-                        ImGui.EndMenu();
-                    }
+                    if (!isTrigger && IconMenuItem(FontAwesomeIcon.Crosshairs, "Retarget Priority", Col(0.4f, 0.85f, 1f)))
+                        OpenRetargetEdit(node.Id);
                 }
                 ImGui.Separator();
                 if (IconMenuItem(FontAwesomeIcon.Copy, "Copy", Col(0.45f, 0.80f, 0.85f))) {
@@ -1445,13 +1487,13 @@ public class FlowEditorWindow : Window {
                 "Right-click to add nodes  •  Middle-drag to pan  •  Drag output port (right circle) to wire");
 
         // ── Deferred popup opens (must be outside all BeginPopup contexts) ──
-        if (_pendingOpenPicker)     { ImGui.OpenPopup("Pick Action##picker");        _pendingOpenPicker     = false; }
+        if (_pendingOpenNodeEdit)   { ImGui.OpenPopup("Edit Action##nodeedit");      _pendingOpenNodeEdit   = false; }
         if (_pendingOpenBranchEdit) { ImGui.OpenPopup("Priority Outputs##branchedit"); _pendingOpenBranchEdit = false; }
         if (_pendingOpenCondEdit)   { ImGui.OpenPopup("Edit Condition##condedit");   _pendingOpenCondEdit   = false; }
         if (_pendingOpenNoteEdit)   { ImGui.OpenPopup("Edit Note##noteedit");        _pendingOpenNoteEdit   = false; }
 
         // ── Modals ────────────────────────────────────────────────────────
-        DrawActionPicker();
+        DrawNodeEdit();
         DrawBranchEdit();
         DrawConditionEdit();
         DrawNoteEdit();
@@ -1587,6 +1629,26 @@ public class FlowEditorWindow : Window {
         _pendingOpenBranchEdit = true;
     }
 
+    private void OpenRetargetEdit(string nodeId) {
+        _editNodeId = nodeId;
+        var node = _flow!.Nodes.Find(n => n.Id == nodeId);
+        if (node != null) SeedEditStaging(node);
+        _editActiveTab       = 1;
+        _pendingOpenNodeEdit = true;
+    }
+
+    // Copy the node's current action + retarget state into the staging buffers (migrating a legacy
+    // single retarget mode into the chain form). Tabs edit the buffers; OK writes them back.
+    private void SeedEditStaging(FlowNode node) {
+        _editActionId    = node.ActionId;
+        _editActionLabel = node.ActionLabel;
+        _editIconId      = node.IconId;
+        _editIsOgcd      = node.IsOgcd;
+        _editRetarget    = node.RetargetPriority.Count > 0 ? new(node.RetargetPriority)
+                         : node.RetargetMode != 0 ? new() { node.RetargetMode }
+                         : new();
+    }
+
     private void DrawBranchEdit() {
         if (_branchEditNodeId == null) return;
 
@@ -1637,23 +1699,77 @@ public class FlowEditorWindow : Window {
     }
 
     private void OpenPicker(string nodeId) {
-        _pickerNodeId     = nodeId;
+        _editNodeId       = nodeId;
         _pickerSearch     = "";
         _pickerLastSearch = "\0";
         _pickerResults.Clear();
         BuildJobCategorySet();
-        _pendingOpenPicker = true;
+        var node = _flow!.Nodes.Find(n => n.Id == nodeId);
+        if (node != null) SeedEditStaging(node);
+        _editActiveTab       = 0;
+        _pendingOpenNodeEdit = true;
     }
 
-    private void DrawActionPicker() {
-        if (_pickerNodeId == null) return;
+    // Merged Action/Retarget editor: one modal, two pill tabs, both editing the node live.
+    private void DrawNodeEdit() {
+        if (_editNodeId == null) return;
+        var node = _flow!.Nodes.Find(n => n.Id == _editNodeId);
+        if (node == null) { _editNodeId = null; return; }
 
-        ImGui.SetNextWindowSizeConstraints(new Vector2(380, 420), new Vector2(float.MaxValue, float.MaxValue));
-        ImGui.SetNextWindowSize(new Vector2(420, 520), ImGuiCond.FirstUseEver);
-        if (!ImGui.BeginPopupModal("Pick Action##picker", ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)) return;
+        // Auto-fit to content (non-resizable), like the condition popup.
+        if (!ImGui.BeginPopupModal("Edit Action##nodeedit",
+                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.AlwaysAutoResize)) return;
 
-        ImGui.SetNextItemWidth(-1f);
-        ImGui.InputText("##search", ref _pickerSearch, 256);
+        // Retarget only applies to Action chain nodes (not triggers).
+        var canRetarget = node.Type == NodeType.Action;
+        if (!canRetarget) _editActiveTab = 0;
+        DrawTabButton(FontAwesomeIcon.Bolt, "Action", _editActiveTab == 0, () => _editActiveTab = 0);
+        if (canRetarget) {
+            ImGui.SameLine(0, 6f);
+            DrawTabButton(FontAwesomeIcon.Crosshairs, "Retarget", _editActiveTab == 1, () => _editActiveTab = 1);
+        }
+        ImGui.Separator();
+
+        if (_editActiveTab == 0) DrawActionTab();
+        else                     DrawRetargetTab();
+        ImGui.Dummy(new Vector2(0f, 4f));
+
+        // OK / Cancel — apply staged edits on OK, discard on Cancel (matches the condition popup).
+        var btnW = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+        ImGui.PushStyleColor(ImGuiCol.Button,        Style.AccentColor);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Style.AccentHover);
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.AccentActive);
+        ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.102f, 0.106f, 0.118f, 1f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
+        if (ImGui.Button("OK", new Vector2(btnW, 0f))) {
+            node.ActionId    = _editActionId;
+            node.ActionLabel = _editActionLabel;
+            node.IconId      = _editIconId;
+            node.IsOgcd      = _editIsOgcd;
+            if (canRetarget) {
+                node.RetargetPriority = new(_editRetarget);
+                node.RetargetMode     = 0;   // fully migrated to the chain
+            }
+            FlowExecutor.InvalidateFlow(_flow.Id);
+            Commit();
+            _editNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.PopStyleVar();
+        ImGui.PopStyleColor(4);
+        ImGui.SameLine();
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
+        if (ImGui.Button("Cancel", new Vector2(btnW, 0f))) { _editNodeId = null; ImGui.CloseCurrentPopup(); }
+        ImGui.PopStyleVar();
+        ImGui.EndPopup();
+    }
+
+    private const float ActionTabWidth  = 400f;
+    private const float ActionListHeight = 340f;
+
+    private void DrawActionTab() {
+        ImGui.SetNextItemWidth(ActionTabWidth);
+        ImGui.InputTextWithHint("##search", "search action…", ref _pickerSearch, 256);
 
         if (_pickerSearch != _pickerLastSearch) {
             _pickerLastSearch = _pickerSearch;
@@ -1664,50 +1780,66 @@ public class FlowEditorWindow : Window {
         ImGui.SameLine(0, 6f);
         DrawTabButton("PvP",  _pickerPvpTab, () => _pickerPvpTab = true);
 
-        ImGui.BeginChild("##area", new Vector2(0, -ImGui.GetFrameHeightWithSpacing()), false);
-        DrawPickerList(_pickerPvpTab);
-        ImGui.EndChild();
-
-        void DrawPickerList(bool pvp) {
-            ImGui.BeginChild(pvp ? "##rpvp" : "##rpve", Vector2.Zero, true);
-            foreach (var (id, name, icon, level, isPvp) in _pickerResults) {
-                if (isPvp != pvp) continue;
-                var rowStart = ImGui.GetCursorPos();
-                bool clicked = ImGui.Selectable($"##s{id}", false, ImGuiSelectableFlags.None, new Vector2(0f, 36f));
-                ImGui.SetCursorPos(rowStart);
-                if (icon != 0) {
-                    var tex = Plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(icon))?.GetWrapOrDefault();
-                    if (tex != null) {
-                        ImGui.Image(tex.Handle, new Vector2(36f, 36f));
-                        ImGui.SameLine();
-                    }
-                }
-                ImGui.SetCursorPosY(rowStart.Y + (36f - ImGui.GetTextLineHeight()) * 0.5f);
-                ImGui.TextUnformatted($"Lv{level}  {name}");
-                if (clicked) {
-                    var node = _flow!.Nodes.Find(n => n.Id == _pickerNodeId);
-                    if (node != null) {
-                        node.ActionId    = id;
-                        node.ActionLabel = name;
-                        node.IconId      = icon;
-                        node.IsOgcd      = ActionHelper.IsOgcd(id);
-                        FlowExecutor.InvalidateFlow(_flow.Id);
-                        Commit();
-                    }
-                    _pickerNodeId = null;
-                    ImGui.CloseCurrentPopup();
+        var pvp = _pickerPvpTab;
+        ImGui.BeginChild(pvp ? "##rpvp" : "##rpve", new Vector2(ActionTabWidth, ActionListHeight), true);
+        foreach (var (id, name, icon, level, isPvp) in _pickerResults) {
+            if (isPvp != pvp) continue;
+            var rowStart = ImGui.GetCursorPos();
+            bool clicked = ImGui.Selectable($"##s{id}", _editActionId == id, ImGuiSelectableFlags.None, new Vector2(0f, 36f));
+            ImGui.SetCursorPos(rowStart);
+            if (icon != 0) {
+                var tex = Plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(icon))?.GetWrapOrDefault();
+                if (tex != null) {
+                    ImGui.Image(tex.Handle, new Vector2(36f, 36f));
+                    ImGui.SameLine();
                 }
             }
-            ImGui.EndChild();
+            ImGui.SetCursorPosY(rowStart.Y + (36f - ImGui.GetTextLineHeight()) * 0.5f);
+            ImGui.TextUnformatted($"Lv{level}  {name}");
+            if (clicked) {
+                _editActionId    = id;
+                _editActionLabel = name;
+                _editIconId      = icon;
+                _editIsOgcd      = ActionHelper.IsOgcd(id);   // staged; applied on OK
+            }
+        }
+        ImGui.EndChild();
+    }
+
+    private void DrawRetargetTab() {
+        ImGui.TextDisabled("Tried top-to-bottom; first valid, in-range target wins.");
+        ImGui.Spacing();
+
+        // ── Preset bar: load a saved chain, or jump to the presets manager ───
+        var presets = Plugin.Config.RetargetPresets;
+        ImGui.SetNextItemWidth(160f);
+        if (ImGui.BeginCombo("##loadpreset", "Load preset")) {
+            if (presets.Count == 0) ImGui.TextDisabled("(no presets)");
+            for (var p = 0; p < presets.Count; p++) {
+                var pr = presets[p];
+                if (ImGui.Selectable((pr.Name.Length > 0 ? pr.Name : "(unnamed)") + $"##lp{p}"))
+                    _editRetarget = new(pr.Modes);   // snapshot copy; applied to node on OK
+            }
+            ImGui.EndCombo();
+        }
+        ImGui.SameLine();
+        if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.Cog, "Manage presets"))
+            ImGui.OpenPopup("Manage presets##presetmgr");
+        var mgrBtnMin = ImGui.GetItemRectMin();
+        var mgrBtnMax = ImGui.GetItemRectMax();
+
+        // Nested popup over the node modal — anchored under the button, not at the cursor.
+        ImGui.SetNextWindowPos(new Vector2(mgrBtnMin.X, mgrBtnMax.Y + 4f));
+        ImGui.SetNextWindowSize(new Vector2(380f, 420f), ImGuiCond.Appearing);
+        if (ImGui.BeginPopup("Manage presets##presetmgr")) {
+            if (RetargetUi.DrawPresetManager(Plugin.Config.RetargetPresets)) Plugin.Config.Save();
+            ImGui.EndPopup();
         }
 
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(20f, 5f));
-        if (ImGui.Button("Cancel")) {
-            _pickerNodeId = null;
-            ImGui.CloseCurrentPopup();
-        }
-        ImGui.PopStyleVar();
-        ImGui.EndPopup();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        RetargetUi.DrawChainEditor("rtg", _editRetarget);
     }
 
     private static void DrawTabButton(string label, bool active, Action onClick) {
@@ -1727,6 +1859,42 @@ public class FlowEditorWindow : Window {
         if (ImGui.Button(label)) onClick();
         ImGui.PopStyleVar(2);
         ImGui.PopStyleColor(4);
+    }
+
+    // Pill tab with a leading FontAwesome icon. Renders icon (icon font) + label (default font)
+    // over one sized button so the pill styling is preserved.
+    private static void DrawTabButton(FontAwesomeIcon icon, string label, bool active, Action onClick) {
+        var bg3      = new Vector4(0.173f, 0.180f, 0.200f, 1f);
+        var bg3Hov   = new Vector4(0.216f, 0.224f, 0.247f, 1f);
+        var textDark = new Vector4(0.102f, 0.106f, 0.118f, 1f);
+        var textDim  = new Vector4(0.565f, 0.573f, 0.588f, 1f);
+        ImGui.PushStyleColor(ImGuiCol.Button,        active ? Style.AccentColor  : bg3);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, active ? Style.AccentHover  : bg3Hov);
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  active ? Style.AccentActive : bg3Hov);
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding,  new Vector2(20f, 5f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 20f);
+
+        var ico = icon.ToIconString();
+        Vector2 icoSz;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle?.Push()) icoSz = ImGui.CalcTextSize(ico);
+        var txtSz = ImGui.CalcTextSize(label);
+        const float gap = 6f;
+        var pad     = ImGui.GetStyle().FramePadding;
+        var btnSize = new Vector2(icoSz.X + gap + txtSz.X + pad.X * 2f, MathF.Max(icoSz.Y, txtSz.Y) + pad.Y * 2f);
+
+        var p       = ImGui.GetCursorScreenPos();
+        var clicked = ImGui.Button($"##tab_{label}", btnSize);
+        var dl      = ImGui.GetWindowDrawList();
+        var textCol = ImGui.GetColorU32(active ? textDark : textDim);
+        var cy      = p.Y + btnSize.Y * 0.5f;
+        var x       = p.X + pad.X;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle?.Push())
+            dl.AddText(new Vector2(x, cy - icoSz.Y * 0.5f), textCol, ico);
+        dl.AddText(new Vector2(x + icoSz.X + gap, cy - txtSz.Y * 0.5f), textCol, label);
+
+        ImGui.PopStyleVar(2);
+        ImGui.PopStyleColor(3);
+        if (clicked) onClick();
     }
 
     private static readonly string[] _allJobs = {
@@ -1848,7 +2016,7 @@ public class FlowEditorWindow : Window {
 
         ImGui.TextDisabled("Field");
         ImGui.SetNextItemWidth(CondW);
-        ImGui.InputText("##cfsearch", ref _condFieldSearch, 64);
+        ImGui.InputTextWithHint("##cfsearch", "search…", ref _condFieldSearch, 64);
 
         ImGui.BeginChild("##cffield", new Vector2(CondW, 160f), true);
         if (fields != null) {
@@ -1885,7 +2053,7 @@ public class FlowEditorWindow : Window {
 
         ImGui.TextDisabled("Check");
         ImGui.SetNextItemWidth(CondW);
-        ImGui.InputText("##cfsearch", ref _condFieldSearch, 64);
+        ImGui.InputTextWithHint("##cfsearch", "search…", ref _condFieldSearch, 64);
 
         ImGui.BeginChild("##cffield", new Vector2(CondW, 120f), true);
         if (defs != null)

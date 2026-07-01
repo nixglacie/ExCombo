@@ -94,14 +94,12 @@ internal sealed class ActionHook : IDisposable {
                     if (!flow.Enabled) continue;
                     foreach (var trigger in flow.Nodes) {
                         if (trigger.Type != NodeType.Trigger) continue;
-                        var mode = FlowExecutor.GetRetargetForUsedAction(flow, trigger, actionId);
-                        if (mode == 0) continue;
-                        var resolved = Helpers.RetargetResolver.Resolve((RetargetMode)mode);
+                        var resolved = FlowExecutor.ResolveRetargetTarget(flow, trigger, actionId);
                         if (resolved is { } tid && tid != 0) {
-                            Plugin.LogDebug($"[ExCombo][Retarget] id={actionId} mode={(RetargetMode)mode} → {tid}");
+                            Plugin.LogDebug($"[ExCombo][Retarget] id={actionId} → {tid}");
                             targetId = tid;
+                            goto resolved_done;
                         }
-                        goto resolved_done;
                     }
                 }
                 resolved_done: ;

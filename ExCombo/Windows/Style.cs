@@ -111,6 +111,10 @@ internal static class Style {
         ImGui.PushStyleColor(ImGuiCol.ChildBg,              v4bg1);
         ImGui.PushStyleColor(ImGuiCol.TableBorderLight,     v4border);
 
+        // Modal dim is rendered at frame-end (after Pop), so a pushed color never applies — write the
+        // persistent style value directly instead. Solid black behind our modals.
+        ImGui.GetStyle().Colors[(int)ImGuiCol.ModalWindowDimBg] = new Vector4(0f, 0f, 0f, 0.4f);
+
         // ── Style vars ───────────────────────────────────────────────
         ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding,    8f);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize,  1f);

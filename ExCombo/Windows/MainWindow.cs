@@ -21,6 +21,7 @@ public class MainWindow : Window {
     // Rename state
     private string  _pendingRename = "";
     private string? _renamingId;
+    private bool    _renameFocus;      // focus the rename field the frame it opens
 
     // New-flow dialog state
     private bool   _dlgVisible;
@@ -82,7 +83,7 @@ public class MainWindow : Window {
         ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.AccentActive);
         ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.102f, 0.106f, 0.118f, 1f));
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(14f, 6f));
-        if (ImGui.Button("+ New Flow")) {
+        if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.FileCirclePlus, "New Flow")) {
             _newFlowName  = "";
             _newFlowJob   = "";
             _dlgVisible   = true;
@@ -93,7 +94,7 @@ public class MainWindow : Window {
 
         ImGui.SameLine(0, 8f);
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(12f, 6f));
-        if (ImGui.Button("Import")) TryImport();
+        if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.FileImport, "Import")) TryImport();
         ImGui.PopStyleVar();
 
         // Settings button — right-aligned
@@ -253,12 +254,22 @@ public class MainWindow : Window {
                 // ── Name / rename ──────────────────────────────────────────
                 if (_renamingId == flow.Id) {
                     ImGui.SetCursorScreenPos(new Vector2(ImGui.GetCursorScreenPos().X, midY - ImGui.GetFrameHeight() / 2f));
-                    ImGui.SetNextItemWidth(160f);
-                    if (ImGui.InputText("##rename", ref _pendingRename, 64, ImGuiInputTextFlags.EnterReturnsTrue))
-                        CommitRename(flow);
-                    if (ImGui.IsKeyPressed(ImGuiKey.Escape)) _renamingId = null;
-                    ImGui.SameLine(0, 4f);
-                    if (ImGui.SmallButton("OK")) CommitRename(flow);
+                    // Cap width so the field stops before the right-side trigger icons / action buttons.
+                    const float RIcoSz = 26f, RIcoGap = 4f, RTrigSz = 26f, RTrigGap = 4f;
+                    float rWinW  = ImGui.GetWindowWidth();
+                    float rPadX  = ImGui.GetStyle().WindowPadding.X;
+                    float rDelX  = rWinW - rPadX - RowPadX - RIcoSz;
+                    float rEditX = rDelX - 3f * (RIcoGap + RIcoSz);
+                    int   rTrigN = flow.Nodes.FindAll(n => n.Type == NodeType.Trigger && n.IconId != 0).Count;
+                    float rTrigW = rTrigN * RTrigSz + Math.Max(0, rTrigN - 1) * RTrigGap;
+                    float rRight = rEditX - 10f - rTrigW;
+                    float rAvail = rRight - ImGui.GetCursorPosX() - 8f;
+                    ImGui.SetNextItemWidth(Math.Clamp(rAvail, 80f, 220f));
+                    if (_renameFocus) { ImGui.SetKeyboardFocusHere(); _renameFocus = false; }
+                    var entered = ImGui.InputText("##rename", ref _pendingRename, 64, ImGuiInputTextFlags.EnterReturnsTrue);
+                    if (ImGui.IsKeyPressed(ImGuiKey.Escape))                 _renamingId = null;   // cancel
+                    else if (entered || ImGui.IsItemDeactivatedAfterEdit())  CommitRename(flow);   // Enter or click-away
+                    else if (ImGui.IsItemDeactivated())                      _renamingId = null;   // clicked away, no change
                 } else {
                     var textSz  = ImGui.CalcTextSize(flow.Name);
                     var namePos = new Vector2(ImGui.GetCursorScreenPos().X, midY - textSz.Y / 2f);
@@ -270,6 +281,7 @@ public class MainWindow : Window {
                     if (ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
                         _renamingId    = flow.Id;
                         _pendingRename = flow.Name;
+                        _renameFocus   = true;
                     }
                     if (ImGui.IsItemHovered()) Tip("Double-click to rename · right-click to reorder");
                     if (ImGui.IsItemClicked(ImGuiMouseButton.Right)) ImGui.OpenPopup("##flowctx");
@@ -346,20 +358,20 @@ public class MainWindow : Window {
 
                 // Export (file-export)
                 ImGui.SetCursorPos(new Vector2(expX, btnY));
-                ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.173f, 0.180f, 0.200f, 1f));
-                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.333f, 0.353f, 0.388f, 1f));
-                ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.Accent(0.20f));
-                ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.565f, 0.573f, 0.588f, 1f));
+                ImGui.PushStyleColor(ImGuiCol.Button,        Style.Accent(0.12f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Style.Accent(0.25f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.Accent(0.40f));
+                ImGui.PushStyleColor(ImGuiCol.Text,          Style.Accent(0.85f));
                 if (ImGuiComponents.IconButton(FontAwesomeIcon.FileExport, icoSize)) ExportFlow(flow);
                 ImGui.PopStyleColor(4);
                 if (ImGui.IsItemHovered()) Tip("Export to clipboard");
 
                 // Duplicate (copy)
                 ImGui.SetCursorPos(new Vector2(cloneX, btnY));
-                ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.173f, 0.180f, 0.200f, 1f));
-                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.333f, 0.353f, 0.388f, 1f));
-                ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.Accent(0.20f));
-                ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.565f, 0.573f, 0.588f, 1f));
+                ImGui.PushStyleColor(ImGuiCol.Button,        Style.Accent(0.12f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Style.Accent(0.25f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.Accent(0.40f));
+                ImGui.PushStyleColor(ImGuiCol.Text,          Style.Accent(0.85f));
                 if (ImGuiComponents.IconButton(FontAwesomeIcon.Copy, icoSize)) toClone = flow.Id;
                 ImGui.PopStyleColor(4);
                 if (ImGui.IsItemHovered()) Tip("Duplicate");

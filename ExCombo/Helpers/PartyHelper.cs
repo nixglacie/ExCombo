@@ -62,6 +62,29 @@ internal static class PartyHelper {
         return best;
     }
 
+    // Lowest absolute HP (not %) — the smallest current HP among living members.
+    public static IBattleChara? LowestHpAbs() {
+        IBattleChara? best = null; uint bestHp = uint.MaxValue;
+        foreach (var m in Members()) {
+            if (m.MaxHp == 0 || m.CurrentHp == 0) continue;
+            if (m.CurrentHp < bestHp) { bestHp = m.CurrentHp; best = m; }
+        }
+        return best;
+    }
+
+    // ClassJob.Role: 1=tank, 2=melee DPS, 3=ranged DPS (phys + caster), 4=healer.
+    public static IBattleChara? FirstByRole(byte role) {
+        foreach (var m in Members())
+            if ((m.ClassJob.ValueNullable?.Role ?? 0) == role) return m;
+        return null;
+    }
+
+    // Party member by 0-based slot order; null if out of range.
+    public static IBattleChara? Slot(int index) {
+        var m = Members();
+        return index >= 0 && index < m.Count ? m[index] : null;
+    }
+
     public static int DeadCount() {
         int n = 0;
         foreach (var m in Members()) if (m.CurrentHp == 0) n++;

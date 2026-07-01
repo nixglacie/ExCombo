@@ -3,6 +3,7 @@ using System.Numerics;
 using System.Reflection;
 using System.Text.Json;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface;
 using Dalamud.Interface.Windowing;
 
 namespace ExCombo.Windows;
@@ -25,7 +26,7 @@ public class ConfigWindow : Window {
     public override void PreDraw()  => Style.Push();
     public override void PostDraw() => Style.Pop();
 
-    private static readonly string[] Tabs = { "General", "Behavior", "Editor", "Theme", "Debug", "About" };
+    private static readonly string[] Tabs = { "General", "Behavior", "Editor", "Theme", "Presets", "Debug", "About" };
     private int _tab;
 
     public override void Draw() {
@@ -42,8 +43,9 @@ public class ConfigWindow : Window {
             case 1: DrawBehavior(); break;
             case 2: DrawEditor();   break;
             case 3: DrawTheme();    break;
-            case 4: DrawDebug();    break;
-            case 5: DrawAbout();    break;
+            case 4: DrawPresets();  break;
+            case 5: DrawDebug();    break;
+            case 6: DrawAbout();    break;
         }
     }
 
@@ -328,6 +330,17 @@ public class ConfigWindow : Window {
         if (ImGui.Button(_debug.IsOpen ? "Close debug overlay" : "Open debug overlay"))
             _debug.Toggle();
         Help("Live table of every enabled trigger: next action, queue/commit state, weave budget, active branch port, GCD spine.");
+    }
+
+    // ── Presets ──────────────────────────────────────────────────────────
+    private void DrawPresets() {
+        ImGui.Spacing();
+        ImGui.TextWrapped("Reusable retarget priority chains. Load them from a node's Retarget tab (applied as a copy).");
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        if (RetargetUi.DrawPresetManager(_config.RetargetPresets)) _config.Save();
     }
 
     // ── About ────────────────────────────────────────────────────────────

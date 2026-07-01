@@ -16,6 +16,9 @@ internal static unsafe class WeaveHelper {
     private static float GCDTotal  => ActionManager.Instance()->GetRecastGroupDetail(57)->Total;
     private static float AnimLock  => ActionManager.Instance()->AnimationLock;
 
+    // Player-wide animation lock; rises on any real cast (GCD or oGCD) then decays each frame.
+    public static float CurrentAnimLock => ActionManager.Instance()->AnimationLock;
+
     public static bool CanWeave(int weavedCount, int maxWeaves = 2) =>
         weavedCount < maxWeaves
         && AnimLock <= BaseAnimLock
