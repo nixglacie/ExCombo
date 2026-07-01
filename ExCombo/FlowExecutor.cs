@@ -238,6 +238,28 @@ internal static class FlowExecutor {
     // Live evaluation of a gate node against current game state. Used by the editor to tint gates.
     public static bool EvalGate(ComboFlow flow, FlowNode node) => EvaluateCondition(flow.Job, node);
 
+    // ── Live inspector queries (read-only views over private _states) ────────
+    // Keys are "{flow.Id}:{trigger.Id}", so a flow's states are those whose key starts flow.Id.
+
+    // True if any trigger in this flow currently has this action node queued as its next press.
+    public static bool IsQueuedAction(ComboFlow flow, string nodeId) {
+        foreach (var kv in _states)
+            if (kv.Key.StartsWith(flow.Id) && kv.Value.NextActionId == nodeId) return true;
+        return false;
+    }
+
+    // True if this trigger currently has a live run state.
+    public static bool TriggerActive(ComboFlow flow, string triggerId) =>
+        _states.ContainsKey($"{flow.Id}:{triggerId}");
+
+    // Currently active output port of the given branch node across the flow's states, or -1.
+    public static int ActiveBranchPort(ComboFlow flow, string branchNodeId) {
+        foreach (var kv in _states)
+            if (kv.Key.StartsWith(flow.Id) && kv.Value.CurrentBranchId == branchNodeId)
+                return kv.Value.CurrentBranchPort;
+        return -1;
+    }
+
     public readonly record struct TriggerDbg(
         string FlowName, string Job, uint TriggerId, string TriggerLabel, bool HasState,
         uint NextActionId, string NextLabel, bool Pending,

@@ -317,10 +317,10 @@ public class ConfigWindow : Window {
 
         ImGui.Spacing();
         bool inspect = _config.ShowConditionState;
-        if (ImGui.Checkbox("Live condition inspector", ref inspect)) {
+        if (ImGui.Checkbox("Live flow inspector", ref inspect)) {
             _config.ShowConditionState = inspect; _config.Save();
         }
-        Help("In the flow editor, tint each gate node's border green (true) or red (false) by its live evaluation. Combat only.");
+        Help("In the flow editor during combat: gates tint green (true) / red (false); actions tint green (ready) / red (blocked) with the queued action highlighted; triggers and branches show their live state. Combat only.");
 
         ImGui.Spacing();
         ImGui.Separator();

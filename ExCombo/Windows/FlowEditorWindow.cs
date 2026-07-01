@@ -770,6 +770,8 @@ public class FlowEditorWindow : Window {
             var isGate      = FlowNode.IsGate(node.Type);
             var isJobCond   = node.Type == NodeType.Condition;
             var isNote      = node.Type == NodeType.Note;
+            // Live flow inspector: draw per-type state rings only while in combat.
+            var inspect     = _config.ShowConditionState && Helpers.PlayerStateHelper.InCombat();
             var nodeH       = NodeHeight(node);
             var nodeW       = NodeWidthOf(node);
             var sp          = canvasMin + _canvasOffset + new Vector2(node.X, node.Y);
@@ -947,6 +949,12 @@ public class FlowEditorWindow : Window {
                 dl.AddRect(sp, sp + new Vector2(NodeSize.X, nodeH), borderCol, 6f, ImDrawFlags.None,
                     isSelected || nodeHovered ? 2f : 1.5f);
 
+                // Live flow inspector: which output port is currently driving the rotation (-1 = none).
+                var inspActivePort = inspect ? FlowExecutor.ActiveBranchPort(_flow!, node.Id) : -1;
+                if (inspActivePort >= 0)
+                    dl.AddRect(sp - new Vector2(3f, 3f), sp + new Vector2(NodeSize.X + 3f, nodeH + 3f),
+                        Col(0.30f, 0.85f, 0.30f, 0.6f), 8f, ImDrawFlags.None, 2f);
+
                 var label      = "Priority";
                 var labelWidth = ImGui.CalcTextSize(label).X;
                 var labelPos   = sp + new Vector2((NodeSize.X - labelWidth) * 0.5f, -16f);
@@ -967,6 +975,10 @@ public class FlowEditorWindow : Window {
                     dl.AddCircleFilled(portPos, PortRadius,
                         portHovered ? Col(0.6f, 0.8f, 1f) : Col(0.25f, 0.25f, 0.35f));
                     dl.AddCircle(portPos, PortRadius, Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
+
+                    // Live flow inspector: ring the active port bright green.
+                    if (p == inspActivePort)
+                        dl.AddCircle(portPos, PortRadius + 2.5f, Col(0.35f, 1f, 0.35f, 0.95f), 16, 2.5f);
 
                     // Port label (1-based) to the left of port
                     var numLabel = (p + 1).ToString();
@@ -1046,9 +1058,9 @@ public class FlowEditorWindow : Window {
                 dl.AddRect(sp, sp + new Vector2(NodeSize.X, nodeH), borderCol, 6f, ImDrawFlags.None,
                     isSelected || nodeHovered ? 2f : 1.5f);
 
-                // Live condition inspector: tint an outer ring green/red by current eval, in combat only.
-                if (_config.ShowConditionState && _flow is { } inspFlow && Helpers.PlayerStateHelper.InCombat()) {
-                    bool pass = FlowExecutor.EvalGate(inspFlow, node);
+                // Live flow inspector: tint an outer ring green/red by current eval.
+                if (inspect) {
+                    bool pass = FlowExecutor.EvalGate(_flow!, node);
                     var tint  = pass ? Col(0.30f, 0.85f, 0.30f, 0.9f) : Col(0.85f, 0.30f, 0.30f, 0.9f);
                     dl.AddRect(sp - new Vector2(3f, 3f), sp + new Vector2(NodeSize.X + 3f, nodeH + 3f),
                         tint, 8f, ImDrawFlags.None, 2f);
@@ -1114,6 +1126,26 @@ public class FlowEditorWindow : Window {
                 }
 
                 dl.AddRect(sp, sp + NodeSize, borderCol, 6f, ImDrawFlags.None, isSelected || nodeHovered ? 2f : 1.5f);
+
+                // Live flow inspector: triggers show an active-state ring; actions show a
+                // usable(green)/blocked(red) ring plus a gold pulse on the queued next action.
+                if (inspect) {
+                    if (isTrigger) {
+                        if (FlowExecutor.TriggerActive(_flow!, node.Id))
+                            dl.AddRect(sp - new Vector2(3f, 3f), sp + NodeSize + new Vector2(3f, 3f),
+                                Col(0.30f, 0.85f, 0.30f, 0.9f), 8f, ImDrawFlags.None, 2f);
+                    } else {
+                        var ready = Helpers.CooldownHelper.Ready(node.ActionId);
+                        var tint  = ready ? Col(0.30f, 0.85f, 0.30f, 0.9f) : Col(0.85f, 0.30f, 0.30f, 0.9f);
+                        dl.AddRect(sp - new Vector2(3f, 3f), sp + NodeSize + new Vector2(3f, 3f),
+                            tint, 8f, ImDrawFlags.None, 2f);
+                        if (FlowExecutor.IsQueuedAction(_flow!, node.Id)) {
+                            var pulse = 0.65f + 0.35f * MathF.Sin((float)ImGui.GetTime() * 4f);
+                            dl.AddRect(sp - new Vector2(5f, 5f), sp + NodeSize + new Vector2(5f, 5f),
+                                Col(1f, 0.85f, 0.25f, pulse), 9f, ImDrawFlags.None, 2.5f);
+                        }
+                    }
+                }
 
                 // Status badges — centered on the bottom edge (half below). oGCD = lightning,
                 // combo-group = chain. When a node has both, lay them out as a centered pair.
