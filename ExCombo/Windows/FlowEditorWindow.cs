@@ -407,20 +407,25 @@ public class FlowEditorWindow : Window {
         var f = _flow;
 
         OverrideIntRow("Max weaves / GCD", f.MaxWeavesPerGcd, c?.MaxWeavesPerGcd ?? 2, 1, 3,
-            v => { f.MaxWeavesPerGcd = v; _config.Save(); });
+            v => { f.MaxWeavesPerGcd = v; _config.Save(); },
+            "oGCDs allowed per GCD window for this flow. Most jobs double-weave (2); a few triple-weave.");
         OverrideFloatRow("Anim-lock budget", f.AnimLockBudget, c?.AnimLockBudget ?? 0.6f, 0.3f, 1.0f,
-            v => { f.AnimLockBudget = v; _config.Save(); });
+            v => { f.AnimLockBudget = v; _config.Save(); },
+            "Assumed animation lock per action. Raise if oGCDs clip your GCD; lower to weave more aggressively.");
         OverrideFloatRow("Queue lead", f.QueueBudget, c?.QueueBudget ?? 0.5f, 0.2f, 1.0f,
-            v => { f.QueueBudget = v; _config.Save(); });
+            v => { f.QueueBudget = v; _config.Save(); },
+            "How early an action may be queued before it's ready. Roughly your ping headroom.");
         OverrideIntRow("Combo grace (ms)", f.ComboGraceMs, c?.ComboGraceMs ?? 500, 100, 1500,
-            v => { f.ComboGraceMs = v; _config.Save(); });
+            v => { f.ComboGraceMs = v; _config.Save(); },
+            "How long after a press before trusting the game's combo state. Covers buffs applied a frame late.");
         OverrideIntRow("Chain reset (s)", f.ChainResetSeconds, c?.ChainResetSeconds ?? 15, 3, 60,
-            v => { f.ChainResetSeconds = v; _config.Save(); });
+            v => { f.ChainResetSeconds = v; _config.Save(); },
+            "Idle time before an unfinished combo abandons and resets to its trigger.");
 
         ImGui.EndPopup();
     }
 
-    private static void OverrideIntRow(string label, int? val, int global, int min, int max, Action<int?> set) {
+    private static void OverrideIntRow(string label, int? val, int global, int min, int max, Action<int?> set, string help) {
         bool on = val.HasValue;
         if (ImGui.Checkbox($"##ov_{label}", ref on)) set(on ? val ?? global : null);
         ImGui.SameLine();
@@ -429,9 +434,10 @@ public class FlowEditorWindow : Window {
         ImGui.SetNextItemWidth(150f);
         if (ImGui.SliderInt(label, ref v, min, max) && on) set(v);
         if (!on) ImGui.EndDisabled();
+        RowHelp(help);
     }
 
-    private static void OverrideFloatRow(string label, float? val, float global, float min, float max, Action<float?> set) {
+    private static void OverrideFloatRow(string label, float? val, float global, float min, float max, Action<float?> set, string help) {
         bool on = val.HasValue;
         if (ImGui.Checkbox($"##ov_{label}", ref on)) set(on ? val ?? global : null);
         ImGui.SameLine();
@@ -440,6 +446,19 @@ public class FlowEditorWindow : Window {
         ImGui.SetNextItemWidth(150f);
         if (ImGui.SliderFloat(label, ref v, min, max, "%.2f") && on) set(v);
         if (!on) ImGui.EndDisabled();
+        RowHelp(help);
+    }
+
+    // "(?)" marker with a wrapped tooltip, matching the settings window rows.
+    private static void RowHelp(string text) {
+        ImGui.SameLine(0, 6f);
+        ImGui.TextDisabled("(?)");
+        if (!ImGui.IsItemHovered()) return;
+        ImGui.BeginTooltip();
+        ImGui.PushTextWrapPos(300f);
+        ImGui.TextUnformatted(text);
+        ImGui.PopTextWrapPos();
+        ImGui.EndTooltip();
     }
 
     private void Undo() {
@@ -695,9 +714,9 @@ public class FlowEditorWindow : Window {
             const float GBot = 17f; // extra room for the chain badge that hangs below the node's bottom edge
             var gMin = canvasMin + _canvasOffset + new Vector2(gx - GPad, gy - GTop);
             var gMax = canvasMin + _canvasOffset + new Vector2(gx2 + GPad, gy2 + GBot);
-            dl.AddRectFilled(gMin, gMax, Col(1f, 0.7f, 0.2f, 0.08f), 8f);
-            dl.AddRect(gMin, gMax, Col(1f, 0.7f, 0.2f, 0.7f), 8f, ImDrawFlags.None, 2f);
-            dl.AddText(gMin + new Vector2(8f, 6f), Col(1f, 0.8f, 0.4f, 0.95f), "Combo");
+            dl.AddRectFilled(gMin, gMax, Style.ComboU32(0.08f), 8f);
+            dl.AddRect(gMin, gMax, Style.ComboU32(0.7f), 8f, ImDrawFlags.None, 2f);
+            dl.AddText(gMin + new Vector2(8f, 6f), Style.ComboU32(0.95f), "Combo");
 
             // Header strip = drag handle: grab it to move the whole group.
             ImGui.SetCursorScreenPos(gMin);
@@ -737,8 +756,8 @@ public class FlowEditorWindow : Window {
                 const float PadTop = 20f;
                 var eMin = canvasMin + _canvasOffset + new Vector2(ex - PadH, ey - PadTop);
                 var eMax = canvasMin + _canvasOffset + new Vector2(ex2 + PadH, ey2 + PadH);
-                dl.AddRectFilled(eMin, eMax, Col(0.3f, 0.6f, 1f, 0.2f), 6f);
-                DrawDashedRect(dl, eMin, eMax, Col(0.3f, 0.6f, 1f, 0.9f), 1.5f, 6f, 4f, 6f);
+                dl.AddRectFilled(eMin, eMax, Style.AccentU32(0.2f), 6f);
+                DrawDashedRect(dl, eMin, eMax, Style.AccentU32(0.9f), 1.5f, 6f, 4f, 6f);
             }
         }
 
@@ -877,12 +896,12 @@ public class FlowEditorWindow : Window {
             var isSelected = _selectedNodeIds.Contains(node.Id);
             if (isNote) {
                 // ── Note node draw (pure comment, no ports) ───────────────
-                var noteAccent = Col(1f, 1f, 1f);
+                var noteAccent = Style.NodeColU32(NodeType.Note);
                 var borderCol  = isSelected
                     ? Col(1f, 1f, 1f)
                     : nodeHovered || nodeActive
                         ? noteAccent
-                        : Col(1f, 1f, 1f, 0.45f);
+                        : Style.NodeColU32(NodeType.Note, 0.45f);
                 dl.AddRectFilled(sp, sp + new Vector2(nodeW, nodeH), Col(0.12f, 0.12f, 0.13f, 0.95f), 6f);
                 dl.AddRect(sp, sp + new Vector2(nodeW, nodeH), borderCol, 6f, ImDrawFlags.None,
                     isSelected || nodeHovered ? 2f : 1.5f);
@@ -916,14 +935,14 @@ public class FlowEditorWindow : Window {
                 // Resize handle (bottom-right corner)
                 if (overNoteResize || _resizingNoteId == node.Id) ImGui.SetMouseCursor(ImGuiMouseCursor.ResizeNwse);
                 var hc = sp + new Vector2(nodeW, nodeH);
-                var handleCol = overNoteResize || _resizingNoteId == node.Id ? noteAccent : Col(1f, 1f, 1f, 0.5f);
+                var handleCol = overNoteResize || _resizingNoteId == node.Id ? noteAccent : Style.NodeColU32(NodeType.Note, 0.5f);
                 dl.AddTriangleFilled(hc + new Vector2(-12f, -2f), hc + new Vector2(-2f, -2f), hc + new Vector2(-2f, -12f), handleCol);
             } else if (isBranch) {
                 var borderCol = isSelected
                     ? Col(1f, 1f, 1f)
                     : nodeHovered || nodeActive
-                        ? Col(0.70f, 0.40f, 1.00f)
-                        : Col(0.70f, 0.40f, 1.00f, 0.5f);
+                        ? Style.NodeColU32(node.Type)
+                        : Style.NodeColU32(node.Type, 0.5f);
                 dl.AddRectFilled(sp, sp + new Vector2(NodeSize.X, nodeH), Col(0.08f, 0.05f, 0.12f), 6f);
                 dl.AddRect(sp, sp + new Vector2(NodeSize.X, nodeH), borderCol, 6f, ImDrawFlags.None,
                     isSelected || nodeHovered ? 2f : 1.5f);
@@ -931,7 +950,7 @@ public class FlowEditorWindow : Window {
                 var label      = "Priority";
                 var labelWidth = ImGui.CalcTextSize(label).X;
                 var labelPos   = sp + new Vector2((NodeSize.X - labelWidth) * 0.5f, -16f);
-                DrawHelpers.DrawText(dl, labelPos, label, Col(0.70f, 0.40f, 1.00f), true);
+                DrawHelpers.DrawText(dl, labelPos, label, Style.NodeColU32(node.Type), true);
 
                 // Input port (left midpoint)
                 var overInPort = overInStart || (_wireFromNodeId != null && _wireFromNodeId != node.Id
@@ -953,13 +972,13 @@ public class FlowEditorWindow : Window {
                     var numLabel = (p + 1).ToString();
                     var numW     = ImGui.CalcTextSize(numLabel).X;
                     DrawHelpers.DrawText(dl, portPos + new Vector2(-numW - PortRadius - 4f, -7f),
-                        numLabel, Col(0.70f, 0.40f, 1.00f, 0.8f), false);
+                        numLabel, Style.NodeColU32(node.Type, 0.8f), false);
 
                     // Divider line between slots (except after last)
                     if (p < node.OutputCount - 1) {
                         var lineY = sp.Y + (p + 1) * BranchSlotH;
                         dl.AddLine(new Vector2(sp.X + 4f, lineY), new Vector2(sp.X + NodeSize.X - 4f, lineY),
-                            Col(0.70f, 0.40f, 1.00f, 0.2f), 1f);
+                            Style.NodeColU32(node.Type, 0.2f), 1f);
                     }
                 }
 
@@ -978,12 +997,12 @@ public class FlowEditorWindow : Window {
                 }
             } else if (isGate) {
                 // ── Condition-family node draw (all gate types) ───────────
-                var condAccent = Col(0.90f, 0.63f, 0.31f);
+                var condAccent = Style.NodeColU32(node.Type);
                 var borderCol  = isSelected
                     ? Col(1f, 1f, 1f)
                     : nodeHovered || nodeActive
                         ? condAccent
-                        : Col(0.90f, 0.63f, 0.31f, 0.5f);
+                        : Style.NodeColU32(node.Type, 0.5f);
                 dl.AddRectFilled(sp, sp + new Vector2(NodeSize.X, nodeH), Col(0.12f, 0.08f, 0.03f), 6f);
 
                 // Body icon: legacy job gauge = job icon; Status/Cooldown = picked status/action icon;
@@ -1020,7 +1039,7 @@ public class FlowEditorWindow : Window {
                         var sz   = ImGui.GetFontSize();
                         var gsz  = ImGui.CalcTextSize(gstr);
                         dl.AddText(font, sz, sp + new Vector2((NodeSize.X - gsz.X) * 0.5f, (nodeH - gsz.Y) * 0.5f),
-                            Col(0.90f, 0.63f, 0.31f, 0.85f), gstr);
+                            Style.NodeColU32(node.Type, 0.85f), gstr);
                     }
                 }
 
@@ -1075,9 +1094,10 @@ public class FlowEditorWindow : Window {
             } else {
                 // ── Trigger / Action node draw ────────────────────────────
                 var outPort   = sp + new Vector2(NodeSize.X, NodeSize.Y * 0.5f);
-                var accentR   = isTrigger ? 0.635f : 0.455f;
-                var accentG   = isTrigger ? 0.855f : 0.765f;
-                var accentB   = isTrigger ? 0.549f : 1.000f;
+                var na        = Style.NodeColor(node.Type);
+                var accentR   = na.X;
+                var accentG   = na.Y;
+                var accentB   = na.Z;
                 var bgCol     = isTrigger ? Col(0.09f, 0.13f, 0.10f) : Col(0.09f, 0.11f, 0.16f);
                 var borderCol = isSelected
                     ? Col(1f, 1f, 1f)
@@ -1129,9 +1149,9 @@ public class FlowEditorWindow : Window {
                         x += w + gap;
                     }
 
-                    if (hasBolt) Badge(boltStr, boltGsz, boltW, Col(1f, 0.85f, 0.2f, 1f), 0f);
-                    if (hasLink) Badge(linkStr, linkGsz, linkW, Col(1f, 0.7f, 0.2f, 1f), 0.5f);
-                    if (hasRtg)  Badge(rtgStr,  rtgGsz,  rtgW,  Col(0.4f, 0.85f, 1f, 1f), 0f);
+                    if (hasBolt) Badge(boltStr, boltGsz, boltW, Style.BadgeOgcdU32(), 0f);
+                    if (hasLink) Badge(linkStr, linkGsz, linkW, Style.BadgeComboU32(), 0.5f);
+                    if (hasRtg)  Badge(rtgStr,  rtgGsz,  rtgW,  Style.BadgeRetargetU32(), 0f);
                     ImGui.PopFont();
                 }
 
@@ -1171,14 +1191,14 @@ public class FlowEditorWindow : Window {
             // ── Context menu ──────────────────────────────────────────────
             if (ImGui.BeginPopup($"node_ctx_{node.Id}")) {
                 if (isGate) {
-                    if (IconMenuItem(FontAwesomeIcon.Filter, "Edit Condition", Col(0.900f, 0.630f, 0.310f))) OpenConditionEdit(node.Id);
+                    if (IconMenuItem(FontAwesomeIcon.Filter, "Edit Condition", Style.NodeColU32(node.Type))) OpenConditionEdit(node.Id);
                 } else if (isBranch) {
-                    if (IconMenuItem(FontAwesomeIcon.List,   "Edit Outputs", Col(0.700f, 0.400f, 1.000f))) OpenBranchEdit(node.Id, node.OutputCount);
+                    if (IconMenuItem(FontAwesomeIcon.List,   "Edit Outputs", Style.NodeColU32(NodeType.Branch))) OpenBranchEdit(node.Id, node.OutputCount);
                 } else if (isNote) {
                     if (IconMenuItem(FontAwesomeIcon.Edit,   "Edit Note", Col(0.95f, 0.95f, 0.96f))) OpenNoteEdit(node.Id);
                 } else {
                     if (IconMenuItem(FontAwesomeIcon.Edit,   "Edit Action",
-                            isTrigger ? Col(0.635f, 0.855f, 0.549f) : Col(0.455f, 0.765f, 1.000f))) OpenPicker(node.Id);
+                            Style.NodeColU32(node.Type))) OpenPicker(node.Id);
                     if (!isTrigger && IconBeginMenu(FontAwesomeIcon.Crosshairs, "Retarget", Col(0.4f, 0.85f, 1f))) {
                         string[] modes = ["None", "Self", "Lowest HP ally", "Target of target", "Lowest HP enemy", "Dead member"];
                         for (var m = 0; m < modes.Length; m++)
@@ -1216,7 +1236,7 @@ public class FlowEditorWindow : Window {
             // Grouping only applies to Action nodes and needs at least two to be meaningful.
             var actionCount = _flow.Nodes.Count(n => _selectedNodeIds.Contains(n.Id) && n.Type == NodeType.Action);
             if (actionCount >= 2) {
-                if (IconMenuItem(FontAwesomeIcon.ObjectGroup, "Group as Combo", Col(1f, 0.70f, 0.20f))) {
+                if (IconMenuItem(FontAwesomeIcon.ObjectGroup, "Group as Combo", Style.ComboU32())) {
                     var gid = Guid.NewGuid().ToString();
                     foreach (var n in _flow.Nodes)
                         if (_selectedNodeIds.Contains(n.Id) && n.Type == NodeType.Action) n.GroupId = gid;
@@ -1265,8 +1285,8 @@ public class FlowEditorWindow : Window {
         if (_isMarqueeSelecting) {
             var rMin = Vector2.Min(_marqueeStart, _marqueeEnd);
             var rMax = Vector2.Max(_marqueeStart, _marqueeEnd);
-            dl.AddRectFilled(rMin, rMax, Col(0.3f, 0.6f, 1f, 0.2f), 6f);
-            dl.AddRect(rMin, rMax, Col(0.3f, 0.6f, 1f, 0.9f), 6f, ImDrawFlags.None, 1.5f);
+            dl.AddRectFilled(rMin, rMax, Style.AccentU32(0.2f), 6f);
+            dl.AddRect(rMin, rMax, Style.AccentU32(0.9f), 6f, ImDrawFlags.None, 1.5f);
         }
 
         // ── Pending deletes (outside node loop) ───────────────────────────
@@ -1336,10 +1356,10 @@ public class FlowEditorWindow : Window {
         var ctxOpen = ImGui.BeginPopup("##canvas_ctx");
         if (!ctxOpen) { _dropSrcNodeId = null; _dropDstNodeId = null; }   // menu dismissed → drop the dangling wire
         if (ctxOpen) {
-            if (IconMenuItem(FontAwesomeIcon.Bolt,        "Add Trigger",   Col(0.635f, 0.855f, 0.549f))) AddNode(NodeType.Trigger);
-            if (IconMenuItem(FontAwesomeIcon.Magic,       "Add Action",    Col(0.455f, 0.765f, 1.000f))) AddNode(NodeType.Action);
-            if (IconMenuItem(FontAwesomeIcon.CodeBranch,  "Add Priority",  Col(0.700f, 0.400f, 1.000f))) AddNode(NodeType.Branch);
-            var condCol = Col(0.900f, 0.630f, 0.310f);
+            if (IconMenuItem(FontAwesomeIcon.Bolt,        "Add Trigger",   Style.NodeColU32(NodeType.Trigger))) AddNode(NodeType.Trigger);
+            if (IconMenuItem(FontAwesomeIcon.Magic,       "Add Action",    Style.NodeColU32(NodeType.Action))) AddNode(NodeType.Action);
+            if (IconMenuItem(FontAwesomeIcon.CodeBranch,  "Add Priority",  Style.NodeColU32(NodeType.Branch))) AddNode(NodeType.Branch);
+            var condCol = Style.NodeColU32(NodeType.StatusCondition);
             if (IconBeginMenu(FontAwesomeIcon.Filter, "Add Condition", condCol)) {
                 if (IconMenuItem(FontAwesomeIcon.Filter,    "Job Gauge",  condCol)) AddGateNode(NodeType.Condition);
                 if (IconMenuItem(FontAwesomeIcon.Magic,     "Status",     condCol)) AddGateNode(NodeType.StatusCondition);
@@ -1349,7 +1369,7 @@ public class FlowEditorWindow : Window {
                 if (IconMenuItem(FontAwesomeIcon.Users,     "Party",      condCol)) AddGateNode(NodeType.PartyCondition);
                 ImGui.EndMenu();
             }
-            if (IconMenuItem(FontAwesomeIcon.StickyNote,  "Add Note",      Col(0.95f, 0.95f, 0.96f))) AddNoteNode();
+            if (IconMenuItem(FontAwesomeIcon.StickyNote,  "Add Note",      Style.NodeColU32(NodeType.Note))) AddNoteNode();
             if (_clipboardNodes != null) {
                 ImGui.Separator();
                 if (IconMenuItem(FontAwesomeIcon.Paste, $"Paste ({_clipboardNodes.Count} nodes)", Col(0.55f, 0.85f, 0.50f))) {

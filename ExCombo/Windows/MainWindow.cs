@@ -262,10 +262,8 @@ public class MainWindow : Window {
                 } else {
                     var textSz  = ImGui.CalcTextSize(flow.Name);
                     var namePos = new Vector2(ImGui.GetCursorScreenPos().X, midY - textSz.Y / 2f);
-                    float nr = isActive ? 0.455f : 0.827f;
-                    float ng = isActive ? 0.765f : 0.831f;
-                    float nb = isActive ? 1.000f : 0.839f;
-                    dl.AddText(namePos, ImGui.GetColorU32(new Vector4(nr, ng, nb, 1f)), flow.Name);
+                    var nameCol = isActive ? Style.AccentColor : new Vector4(0.827f, 0.831f, 0.839f, 1f);
+                    dl.AddText(namePos, ImGui.GetColorU32(nameCol), flow.Name);
 
                     ImGui.SetCursorScreenPos(namePos);
                     ImGui.InvisibleButton($"##name_{flow.Id}", textSz);
@@ -366,15 +364,19 @@ public class MainWindow : Window {
                 ImGui.PopStyleColor(4);
                 if (ImGui.IsItemHovered()) Tip("Duplicate");
 
-                // Delete (trash)
+                // Delete (trash) — requires Alt held to guard against accidental deletion.
+                bool altHeld = ImGui.GetIO().KeyAlt;
                 ImGui.SetCursorPos(new Vector2(delX, btnY));
                 ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.173f, 0.180f, 0.200f, 1f));
                 ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(1f, 0.522f, 0.569f, 0.18f));
                 ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(1f, 0.522f, 0.569f, 0.35f));
-                ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(1f, 0.522f, 0.569f, 0.80f));
+                ImGui.PushStyleColor(ImGuiCol.Text,          altHeld ? new Vector4(1f, 0.522f, 0.569f, 0.80f)
+                                                                     : new Vector4(0.45f, 0.46f, 0.48f, 1f));
+                if (!altHeld) ImGui.BeginDisabled();
                 if (ImGuiComponents.IconButton(FontAwesomeIcon.Trash, icoSize)) toDelete = flow.Id;
+                if (!altHeld) ImGui.EndDisabled();
                 ImGui.PopStyleColor(4);
-                if (ImGui.IsItemHovered()) Tip("Delete");
+                if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) Tip(altHeld ? "Delete" : "Hold Alt to delete");
 
                 // Advance past row + gap (startCursorPos-based — fixes overlap)
                 ImGui.SetCursorPos(new Vector2(startCursorPos.X, startCursorPos.Y + rowH + RowGap));

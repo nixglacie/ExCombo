@@ -164,10 +164,48 @@ public class ConfigWindow : Window {
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
+        ImGui.Text("Node colors");
+        Help("Colors of each node type in the flow editor (borders, labels, ports). Selection uses the accent color.");
+        ImGui.Spacing();
+        NodeColorRow("Trigger",   _config.NodeColorTrigger,   a => { _config.NodeColorTrigger   = a; _config.Save(); });
+        NodeColorRow("Action",    _config.NodeColorAction,    a => { _config.NodeColorAction    = a; _config.Save(); });
+        NodeColorRow("Priority",  _config.NodeColorBranch,    a => { _config.NodeColorBranch    = a; _config.Save(); });
+        NodeColorRow("Condition", _config.NodeColorCondition, a => { _config.NodeColorCondition = a; _config.Save(); });
+        NodeColorRow("Note",      _config.NodeColorNote,      a => { _config.NodeColorNote      = a; _config.Save(); });
+        NodeColorRow("Combo group", _config.ComboGroupColor,  a => { _config.ComboGroupColor    = a; _config.Save(); });
+
+        ImGui.Spacing();
+        ImGui.Text("Badges");
+        Help("Status badges shown on action nodes: oGCD (lightning), retarget (crosshairs). Combo-group badge uses the combo group color.");
+        ImGui.Spacing();
+        NodeColorRow("oGCD badge",     _config.BadgeOgcdColor,     a => { _config.BadgeOgcdColor     = a; _config.Save(); });
+        NodeColorRow("Combo badge",    _config.BadgeComboColor,    a => { _config.BadgeComboColor    = a; _config.Save(); });
+        NodeColorRow("Retarget badge", _config.BadgeRetargetColor, a => { _config.BadgeRetargetColor = a; _config.Save(); });
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
         if (ImGui.Button("Reset to defaults")) {
-            _config.AccentColor = new[] { 0.455f, 0.765f, 1.0f, 1f };
+            _config.AccentColor        = new[] { 0.455f, 0.765f, 1.0f, 1f };
+            _config.NodeColorTrigger   = new[] { 0.635f, 0.855f, 0.549f };
+            _config.NodeColorAction    = new[] { 0.455f, 0.765f, 1.000f };
+            _config.NodeColorBranch    = new[] { 0.700f, 0.400f, 1.000f };
+            _config.NodeColorCondition = new[] { 0.900f, 0.630f, 0.310f };
+            _config.NodeColorNote      = new[] { 1.000f, 1.000f, 1.000f };
+            _config.ComboGroupColor    = new[] { 1.000f, 0.700f, 0.200f };
+            _config.BadgeOgcdColor     = new[] { 1.000f, 0.850f, 0.200f };
+            _config.BadgeRetargetColor = new[] { 0.400f, 0.850f, 1.000f };
+            _config.BadgeComboColor    = new[] { 1.000f, 0.700f, 0.200f };
             _config.Save();
         }
+    }
+
+    private static void NodeColorRow(string label, float[] arr, Action<float[]> set) {
+        var c = new Vector3(arr.Length > 0 ? arr[0] : 1f,
+                            arr.Length > 1 ? arr[1] : 1f,
+                            arr.Length > 2 ? arr[2] : 1f);
+        ImGui.SetNextItemWidth(220f);
+        if (ImGui.ColorEdit3(label, ref c)) set(new[] { c.X, c.Y, c.Z });
     }
 
     // ── Editor ───────────────────────────────────────────────────────────
