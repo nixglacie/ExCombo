@@ -3,7 +3,7 @@
     "Author": "Exora",
     "Name": "ExCombo",
     "InternalName": "ExCombo",
-    "AssemblyVersion": "1.6.2.0",
+    "AssemblyVersion": "1.6.3.0",
     "Description": "Design your job rotation as a visual node graph. Flows replace hotbar actions in-game as you build them. Use /excombo to open the editor.",
     "Punchline": "Node-based job rotation flow editor.",
     "ApplicableVersion": "any",
