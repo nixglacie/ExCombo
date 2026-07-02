@@ -69,6 +69,16 @@ internal static partial class FlowExecutor {
         return false;
     }
 
+    // Flow-level duty scope. Empty scope = eligible everywhere (fallback). Non-empty = only inside
+    // one of the listed duties.
+    public static bool FlowInScope(ComboFlow flow)
+        => flow.DutyScope.Count == 0 || flow.DutyScope.Contains(Helpers.ContentHelper.CurrentDutyId());
+
+    // Flow explicitly targets the current duty (non-empty scope that contains it). Preferred over an
+    // empty-scope fallback when both share a trigger.
+    public static bool FlowIsSpecificMatch(ComboFlow flow)
+        => flow.DutyScope.Count > 0 && flow.DutyScope.Contains(Helpers.ContentHelper.CurrentDutyId());
+
     public static void Tick(List<ComboFlow> flows) {
         if (ReplacementSuppressed()) return;   // master switch off or a safety gate → no progression
         var now = Environment.TickCount64;

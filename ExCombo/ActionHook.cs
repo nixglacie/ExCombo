@@ -55,19 +55,30 @@ internal sealed class ActionHook : IDisposable {
             return _hook.Original(actionManager, actionId);
         _inDetour = true;
         try {
+            // Duty-scoped selection: among enabled flows triggered by this action, a flow that
+            // specifically targets the current duty wins over an empty-scope fallback; ties fall back
+            // to Configuration.Flows order. Pass 1 = specific match, pass 2 = any in-scope flow.
+            ComboFlow? chosen = null; FlowNode? chosenTrigger = null;
             foreach (var flow in _config.Flows) {
-                if (!flow.Enabled) continue;
-                foreach (var trigger in flow.Nodes) {
-                    if (trigger.Type != NodeType.Trigger) continue;
-                    if (trigger.ActionId == 0 || trigger.ActionId != actionId) continue;
-                    var r       = FlowExecutor.Resolve(flow, trigger, actionId);
-                    var evolved = _hook.Original(actionManager, r);
-                    if (!_lastIcon.TryGetValue(actionId, out var prev) || prev != evolved) {
-                        Plugin.LogDebug($"[ExCombo][Icon] slot={actionId} → {evolved}");
-                        _lastIcon[actionId] = evolved;
-                    }
-                    return evolved;
+                if (!flow.Enabled || !FlowExecutor.FlowIsSpecificMatch(flow)) continue;
+                var t = MatchTrigger(flow, actionId);
+                if (t != null) { chosen = flow; chosenTrigger = t; break; }
+            }
+            if (chosen == null)
+                foreach (var flow in _config.Flows) {
+                    if (!flow.Enabled || !FlowExecutor.FlowInScope(flow)) continue;
+                    var t = MatchTrigger(flow, actionId);
+                    if (t != null) { chosen = flow; chosenTrigger = t; break; }
                 }
+
+            if (chosen != null) {
+                var r       = FlowExecutor.Resolve(chosen, chosenTrigger!, actionId);
+                var evolved = _hook.Original(actionManager, r);
+                if (!_lastIcon.TryGetValue(actionId, out var prev) || prev != evolved) {
+                    Plugin.LogDebug($"[ExCombo][Icon] slot={actionId} → {evolved}");
+                    _lastIcon[actionId] = evolved;
+                }
+                return evolved;
             }
         } catch (Exception ex) {
             Plugin.Log.Error(ex, "ActionHook detour error");
@@ -75,6 +86,14 @@ internal sealed class ActionHook : IDisposable {
             _inDetour = false;
         }
         return _hook.Original(actionManager, actionId);
+    }
+
+    // First Trigger node in `flow` bound to `actionId` (non-zero), or null.
+    private static FlowNode? MatchTrigger(ComboFlow flow, uint actionId) {
+        foreach (var trigger in flow.Nodes)
+            if (trigger.Type == NodeType.Trigger && trigger.ActionId != 0 && trigger.ActionId == actionId)
+                return trigger;
+        return null;
     }
 
     private unsafe bool UseActionDetour(IntPtr actionManager, uint actionType, uint actionId, ulong targetId, uint a4, uint a5, uint a6, IntPtr a7) {
@@ -91,7 +110,7 @@ internal sealed class ActionHook : IDisposable {
         if (actionType == (uint)ActionType.Action) {
             try {
                 foreach (var flow in _config.Flows) {
-                    if (!flow.Enabled) continue;
+                    if (!flow.Enabled || !FlowExecutor.FlowInScope(flow)) continue;
                     foreach (var trigger in flow.Nodes) {
                         if (trigger.Type != NodeType.Trigger) continue;
                         var resolved = FlowExecutor.ResolveRetargetTarget(flow, trigger, actionId);
@@ -117,7 +136,7 @@ internal sealed class ActionHook : IDisposable {
                 // Queue fired but failed (e.g. out of range) — unfreeze so player can retry
                 try {
                     foreach (var flow in _config.Flows) {
-                        if (!flow.Enabled) continue;
+                        if (!flow.Enabled || !FlowExecutor.FlowInScope(flow)) continue;
                         foreach (var trigger in flow.Nodes) {
                             if (trigger.Type != NodeType.Trigger) continue;
                             FlowExecutor.NotifyQueueFailed(flow, trigger);
@@ -140,7 +159,7 @@ internal sealed class ActionHook : IDisposable {
 
         try {
             foreach (var flow in _config.Flows) {
-                if (!flow.Enabled) continue;
+                if (!flow.Enabled || !FlowExecutor.FlowInScope(flow)) continue;
                 foreach (var trigger in flow.Nodes) {
                     if (trigger.Type != NodeType.Trigger) continue;
                     if (a5 == 0) {

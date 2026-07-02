@@ -32,6 +32,7 @@ public class MainWindow : Window {
     private bool   _dlgFocusName;
     private string _newFlowName = "";
     private string _newFlowJob  = "";
+    private readonly List<uint> _newFlowScope = new();   // optional duty scope for the flow being created
 
     // Status
     private string? _statusMsg;
@@ -90,6 +91,7 @@ public class MainWindow : Window {
         if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.FileCirclePlus, "New Flow")) {
             _newFlowName  = "";
             _newFlowJob   = "";
+            _newFlowScope.Clear();
             _dlgVisible   = true;
             _dlgFocusName = true;
         }
@@ -252,7 +254,7 @@ public class MainWindow : Window {
                     if (enabled) {
                         var c = FindTriggerConflict(flow);
                         if (c is { } hit)
-                            SetStatus($"Can't enable \"{flow.Name}\": trigger {hit.label} is already used by active flow \"{hit.other.Name}\" — disable it first.", error: true);
+                            SetStatus($"Can't enable \"{flow.Name}\": trigger {hit.label} is already used by active flow \"{hit.other.Name}\". Two flows on one trigger can desync the combo and crash the game — disable it first.", error: true);
                         else { flow.Enabled = true; _config.Save(); }
                     } else {
                         flow.Enabled = false; _config.Save();
@@ -271,18 +273,20 @@ public class MainWindow : Window {
                     }
                 }
 
+                // Trigger conflict (computed once): shown on both rows of a clashing pair. The warning-
+                // triangle hover surfaces the shared trigger icon(s).
+                (ComboFlow other, string label)? conflict = FindTriggerConflict(flow);
+
                 // ── Name / rename ──────────────────────────────────────────
                 if (_renamingId == flow.Id) {
                     ImGui.SetCursorScreenPos(new Vector2(ImGui.GetCursorScreenPos().X, midY - ImGui.GetFrameHeight() / 2f));
-                    // Cap width so the field stops before the right-side trigger icons / action buttons.
-                    const float RIcoSz = 26f, RIcoGap = 4f, RTrigSz = 26f, RTrigGap = 4f;
+                    // Cap width so the field stops before the right-side action buttons.
+                    const float RIcoSz = 26f, RIcoGap = 4f;
                     // Anchor to the content-region right edge (shrinks with the scrollbar), not the
                     // window width — otherwise the field runs under the scrollbar.
                     float rDelX  = startCursorPos.X + availW - RowPadX - RIcoSz;
                     float rEditX = rDelX - 3f * (RIcoGap + RIcoSz);
-                    int   rTrigN = flow.Nodes.FindAll(n => n.Type == NodeType.Trigger && n.IconId != 0).Count;
-                    float rTrigW = rTrigN * RTrigSz + Math.Max(0, rTrigN - 1) * RTrigGap;
-                    float rRight = rEditX - 10f - rTrigW;
+                    float rRight = rEditX - 10f;
                     float rAvail = rRight - ImGui.GetCursorPosX() - 8f;
                     ImGui.SetNextItemWidth(Math.Clamp(rAvail, 80f, 220f));
                     if (_renameFocus) { ImGui.SetKeyboardFocusHere(); _renameFocus = false; }
@@ -318,8 +322,28 @@ public class MainWindow : Window {
                         ImGui.EndPopup();
                     }
 
+                    // ── Duty-scope badge (map marker + tooltip listing scoped duties) ──
+                    if (flow.DutyScope.Count > 0) {
+                        ImGui.SameLine(0, 8f);
+                        ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
+                        var dIco = FontAwesomeIcon.MapMarkerAlt.ToIconString();
+                        var dSz  = ImGui.CalcTextSize(dIco);
+                        var dPos = new Vector2(ImGui.GetCursorScreenPos().X, midY - dSz.Y / 2f);
+                        dl.AddText(dPos, ImGui.GetColorU32(new Vector4(0.45f, 0.72f, 1f, 1f)), dIco);
+                        ImGui.PopFont();
+                        ImGui.SetCursorScreenPos(dPos);
+                        ImGui.InvisibleButton($"##duty_{flow.Id}", dSz);
+                        if (ImGui.IsItemHovered()) {
+                            var names = string.Join("\n", flow.DutyScope.Select(id => {
+                                var dn = Helpers.ContentHelper.DutyName(id);
+                                return dn.Length > 0 ? dn : $"#{id}";
+                            }));
+                            Tip($"Duty scope ({flow.DutyScope.Count}):\n{names}");
+                        }
+                    }
+
                     // ── Conflict warning (disabled flow blocked by an active one) ──
-                    if (!flow.Enabled && FindTriggerConflict(flow) is { } cf) {
+                    if (conflict is { } cf) {
                         ImGui.SameLine(0, 8f);
                         ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
                         var icoStr = FontAwesomeIcon.ExclamationTriangle.ToIconString();
@@ -329,8 +353,27 @@ public class MainWindow : Window {
                         ImGui.PopFont();
                         ImGui.SetCursorScreenPos(icoPos);
                         ImGui.InvisibleButton($"##warn_{flow.Id}", icoSz);
-                        if (ImGui.IsItemHovered())
-                            Tip($"Conflicts with active flow \"{cf.other.Name}\" (trigger {cf.label}). Disable it to enable this one.");
+                        if (ImGui.IsItemHovered()) {
+                            ImGui.PushStyleVar(ImGuiStyleVar.PopupBorderSize, 1f);
+                            ImGui.PushStyleColor(ImGuiCol.Border, new Vector4(0.40f, 0.42f, 0.46f, 1f));
+                            ImGui.BeginTooltip();
+                            ImGui.TextUnformatted(cf.other.Enabled
+                                ? $"Trigger {cf.label} is already driven by active flow \"{cf.other.Name}\".\nTwo flows fighting over one trigger can desync the combo and crash the game — disable one."
+                                : $"Shares trigger {cf.label} with \"{cf.other.Name}\".\nTwo flows fighting over one trigger can desync the combo and crash the game — keep only one enabled.");
+                            var tnodes = flow.Nodes.FindAll(n => n.Type == NodeType.Trigger && n.IconId != 0);
+                            if (tnodes.Count > 0) {
+                                ImGui.Spacing();
+                                ImGui.TextDisabled("Triggers:");
+                                foreach (var tn in tnodes) {
+                                    var tw = GetIconWrap(tn.IconId);
+                                    if (tw != null) { ImGui.Image(tw.Handle, new Vector2(22f, 22f)); ImGui.SameLine(); }
+                                    ImGui.TextUnformatted(tn.ActionLabel);
+                                }
+                            }
+                            ImGui.EndTooltip();
+                            ImGui.PopStyleColor();
+                            ImGui.PopStyleVar();
+                        }
                     }
                 }
 
@@ -347,24 +390,8 @@ public class MainWindow : Window {
 
                 var icoSize = new Vector2(IcoSz, IcoSz);
 
-                // ── Trigger action icons (left of the edit button) ─────────
-                const float TrigSz  = 26f;
-                const float TrigGap = 4f;
-                var trigNodes = flow.Nodes.FindAll(n => n.Type == NodeType.Trigger && n.IconId != 0);
-                float trigTotalW = trigNodes.Count * TrigSz + Math.Max(0, trigNodes.Count - 1) * TrigGap;
-                float trigStartX = editX - 10f - trigTotalW;
-                float trigY      = midY - TrigSz / 2f - winPos.Y + scrollY;
-                for (var ti = 0; ti < trigNodes.Count; ti++) {
-                    var tw = GetIconWrap(trigNodes[ti].IconId);
-                    if (tw == null) continue;
-                    ImGui.SetCursorPos(new Vector2(trigStartX + ti * (TrigSz + TrigGap), trigY));
-                    var p0 = ImGui.GetCursorScreenPos();
-                    var p1 = p0 + new Vector2(TrigSz, TrigSz);
-                    dl.AddImageRounded(tw.Handle, p0, p1, Vector2.Zero, Vector2.One, 0xFFFFFFFFu, 5f);
-                    dl.AddRect(p0, p1, Col(0.333f, 0.353f, 0.388f, 0.8f), 5f, ImDrawFlags.None, 1f);
-                    ImGui.InvisibleButton($"##trig_{flow.Id}_{ti}", new Vector2(TrigSz, TrigSz));
-                    if (ImGui.IsItemHovered()) Tip(trigNodes[ti].ActionLabel);
-                }
+                // Trigger action icons are no longer shown on the row; they surface only in the
+                // conflict-warning hover (see the conflict block above).
 
                 // Edit (pen)
                 ImGui.SetCursorPos(new Vector2(editX, btnY));
@@ -462,6 +489,10 @@ public class MainWindow : Window {
             DrawJobPicker();
 
             ImGui.Spacing();
+            ImGui.Text("Duty scope (optional):");
+            Helpers.DutyScopeUi.Draw("newflow", _newFlowScope);
+
+            ImGui.Spacing();
             ImGui.Separator();
             ImGui.Spacing();
 
@@ -472,9 +503,10 @@ public class MainWindow : Window {
             ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.102f, 0.106f, 0.118f, 1f));
             if (ImGui.Button("Create", new Vector2(-1f, 0f))) {
                 var flow = new ComboFlow {
-                    Name    = _newFlowName.Trim(),
-                    Job     = _newFlowJob,
-                    Enabled = true,
+                    Name      = _newFlowName.Trim(),
+                    Job       = _newFlowJob,
+                    Enabled   = true,
+                    DutyScope = new(_newFlowScope),
                 };
                 _config.Flows.Add(flow);
                 _config.Save();
@@ -611,7 +643,7 @@ public class MainWindow : Window {
                 if (n.Type == NodeType.Trigger && n.ActionId != 0) importedTriggers.Add(n.ActionId);
             bool conflict = false;
             foreach (var f in _config.Flows) {
-                if (!f.Enabled) continue;
+                if (!f.Enabled || !ScopesConflict(imported, f)) continue;
                 foreach (var n in f.Nodes)
                     if (n.Type == NodeType.Trigger && n.ActionId != 0 && importedTriggers.Contains(n.ActionId)) { conflict = true; break; }
                 if (conflict) break;
@@ -651,12 +683,29 @@ public class MainWindow : Window {
         return s;
     }
 
-    // First active same-job flow that shares a trigger with `flow`, plus the shared action's label.
+    // Two same-trigger flows genuinely conflict only when both could be eligible at once: both are
+    // fallbacks (empty scope), or both are duty-scoped with an overlapping duty set. A fallback paired
+    // with a scoped flow is disambiguated by the executor (scoped wins in-duty, fallback elsewhere).
+    private static bool ScopesConflict(ComboFlow a, ComboFlow b) {
+        bool ae = a.DutyScope.Count == 0, be = b.DutyScope.Count == 0;
+        if (ae && be) return true;
+        if (ae || be) return false;
+        foreach (var id in a.DutyScope) if (b.DutyScope.Contains(id)) return true;
+        return false;
+    }
+
+    // First same-job flow that shares a trigger (with overlapping scope) with `flow`, plus the shared
+    // action's label. Both members of a clashing pair report it, so the triangle shows on each row;
+    // at least one side must be enabled for the clash to matter (two disabled flows are inert). The
+    // enable-checkbox guard calls this while `flow` is still disabled, so it still finds the enabled
+    // blocker it needs.
     private (ComboFlow other, string label)? FindTriggerConflict(ComboFlow flow) {
         var mine = TriggerActionIds(flow);
         if (mine.Count == 0) return null;
         foreach (var other in _config.Flows) {
-            if (other.Id == flow.Id || !other.Enabled || other.Job != flow.Job) continue;
+            if (other.Id == flow.Id || other.Job != flow.Job) continue;
+            if (!other.Enabled && !flow.Enabled) continue;
+            if (!ScopesConflict(flow, other)) continue;
             foreach (var n in other.Nodes) {
                 if (n.Type != NodeType.Trigger || n.ActionId == 0) continue;
                 if (mine.Contains(n.ActionId))

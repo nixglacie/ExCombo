@@ -105,7 +105,7 @@ public class ConfigWindow : Window {
 
         bool kofi = _config.ShowKofiButton;
         if (ImGui.Checkbox("Show Ko-fi button in main window", ref kofi)) { _config.ShowKofiButton = kofi; _config.Save(); }
-        Help("Show the Ko-fi support button in the flow list toolbar. The About tab always has the link.");
+        Help("Show the Ko-fi support button in the flow list toolbar.");
 
         ImGui.Spacing();
         ImGui.Separator();

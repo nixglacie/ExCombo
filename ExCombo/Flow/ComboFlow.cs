@@ -11,6 +11,14 @@ public class ComboFlow {
     public List<FlowNode> Nodes { get; set; } = new();
     public List<FlowEdge> Edges { get; set; } = new();
 
+    // Optional duty scope: ContentFinderCondition RowIds this flow is restricted to. Empty = the flow
+    // is eligible everywhere (overworld + any duty) and acts as the fallback. When several enabled
+    // same-job flows share a trigger, a flow whose scope contains the current duty is chosen over an
+    // empty-scope fallback (see FlowExecutor.FlowInScope / FlowIsSpecificMatch).
+    // Null-coalescing setter so imported JSON with "DutyScope": null can't NRE.
+    private List<uint> _dutyScope = new();
+    public List<uint> DutyScope { get => _dutyScope; set => _dutyScope = value ?? new(); }
+
     // Editor canvas pan offset, persisted so reopening restores the view.
     public float ViewX { get; set; }
     public float ViewY { get; set; }

@@ -100,7 +100,18 @@ public partial class FlowEditorWindow {
             v => { f.ChainResetSeconds = v; _config.Save(); },
             "Idle time before an unfinished combo abandons and resets to its trigger.");
 
+        ImGui.Separator();
+        DrawDutyScope(f);
+
         ImGui.EndPopup();
+    }
+
+    // Per-flow duty scope: restrict the flow to specific instances (ContentFinderCondition ids).
+    // Empty = eligible everywhere; a scoped flow beats an empty-scope fallback on the same trigger
+    // when the player is inside one of its duties. Widget shared with the New Flow dialog.
+    private void DrawDutyScope(ComboFlow f) {
+        ImGui.TextDisabled("Duty scope");
+        if (Helpers.DutyScopeUi.Draw($"editflow_{f.Id}", f.DutyScope)) _config.Save();
     }
 
     private static void OverrideIntRow(string label, int? val, int global, int min, int max, Action<int?> set, string help) {

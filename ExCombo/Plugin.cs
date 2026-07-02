@@ -164,7 +164,7 @@ public sealed class Plugin : IDalamudPlugin {
     private string? _dtrLastKey;
 
     // Server-bar text: "EX", optionally with master On/Off state and/or job icon +
-    // active flow name for the player's current job. Rebuilt each tick, assigned only on change.
+    // count of enabled flows for the player's current job. Rebuilt each tick, assigned only on change.
     private void UpdateDtr() {
         _dtrEntry.Shown = _config.ShowDtrEntry;
         if (!_config.ShowDtrEntry) return;
@@ -177,11 +177,10 @@ public sealed class Plugin : IDalamudPlugin {
             var player = ObjectTable.LocalPlayer;
             var job    = player?.ClassJob.ValueNullable?.Abbreviation.ToString();
             if (!string.IsNullOrEmpty(job)) {
-                var names = _config.Flows.Where(f => f.Enabled && f.Job == job)
-                                         .Select(f => f.Name).ToList();
-                if (names.Count > 0) {
+                var count = _config.Flows.Count(f => f.Enabled && f.Job == job);
+                if (count > 0) {
                     jobRow   = player!.ClassJob.RowId;
-                    flowText = names[0] + (names.Count > 1 ? $" +{names.Count - 1}" : "");
+                    flowText = count.ToString();
                 }
             }
         }

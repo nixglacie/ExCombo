@@ -122,6 +122,8 @@ internal static class RetargetUi {
                 ImGui.EndCombo();
             }
             ImGui.SameLine();
+            bool alt = ImGui.GetIO().KeyAlt;
+            bool trashHover;
             using (Plugin.PluginInterface.UiBuilder.IconFontHandle?.Push()) {
                 ImGui.PushStyleColor(ImGuiCol.Text, Style.Accent(0.85f));
                 if (ImGui.Button(FontAwesomeIcon.ArrowUp.ToIconString()))   moveUp   = i;
@@ -129,10 +131,15 @@ internal static class RetargetUi {
                 if (ImGui.Button(FontAwesomeIcon.ArrowDown.ToIconString())) moveDown = i;
                 ImGui.PopStyleColor();
                 ImGui.SameLine();
-                ImGui.PushStyleColor(ImGuiCol.Text, RedCol);
+                // Delete requires Alt held, like preset/flow deletion.
+                ImGui.PushStyleColor(ImGuiCol.Text, alt ? RedCol : DimCol);
+                if (!alt) ImGui.BeginDisabled();
                 if (ImGui.Button(FontAwesomeIcon.TrashAlt.ToIconString()))  remove   = i;
+                if (!alt) ImGui.EndDisabled();
                 ImGui.PopStyleColor();
+                trashHover = ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled);
             }
+            if (trashHover) ImGui.SetTooltip(alt ? "Delete" : "Hold Alt to delete");
             ImGui.PopID();
         }
 
