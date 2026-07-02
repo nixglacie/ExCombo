@@ -16,6 +16,10 @@ public enum NodeType {
     PartyCondition   = 9,
     ActionHistoryCondition = 10,   // gate on the player's own recent casts (ActionTracker)
     GaugeCondition         = 11,   // gate on a job-gauge field (supersedes the legacy Condition node)
+    LogicCondition         = 12,   // gate combining wired predicate inputs with a boolean expression
+    KeybindCondition       = 13,   // gate that's true while a chosen key is held (KeyState)
+    ToggleCondition        = 14,   // manual on/off switch, persisted; flipped in-editor or via command
+    LatchCondition         = 15,   // set/reset memory: true from SET signal until RESET signal
 }
 
 // Built-in target resolvers for Action-node retargeting (Phase 3).
@@ -94,6 +98,15 @@ public class FlowNode {
     // the branch re-evaluates priority). Null = ungrouped.
     public string? GroupId { get; set; } = null;
 
+    // Logic node: number of predicate input slots (expression references 1..N) and the boolean
+    // expression over them (LogicExpr syntax). "" is treated as "1 AND 2".
+    public int    LogicInputCount { get; set; } = 2;
+    public string LogicExpr       { get; set; } = "";
+
+    // Toggle node: persisted manual switch state. The toggle's display name reuses ActionLabel;
+    // the Keybind node's virtual-key code reuses CheckParamId.
+    public bool ToggleOn { get; set; } = false;
+
     // Field-by-field copy (keeps Id; callers reassign Id when duplicating).
     public FlowNode Clone() => new() {
         Id = Id, Type = Type, X = X, Y = Y, ActionId = ActionId, ActionLabel = ActionLabel,
@@ -102,6 +115,15 @@ public class FlowNode {
         CheckField = CheckField, CheckParamId = CheckParamId, CheckParam2 = CheckParam2, CheckTarget = CheckTarget, CheckSource = CheckSource,
         RetargetMode = RetargetMode, RetargetPriority = new(RetargetPriority), IsOgcd = IsOgcd,
         NoteText = NoteText, NoteW = NoteW, NoteH = NoteH, GroupId = GroupId,
+        LogicInputCount = LogicInputCount, LogicExpr = LogicExpr, ToggleOn = ToggleOn,
+    };
+
+    // Number of predicate (signal) input slots on the node's left, below the flow input.
+    // Logic combines N of them via its expression; Latch has fixed slot 1 = SET, slot 2 = RESET.
+    public int PredicateInputs() => Type switch {
+        NodeType.LogicCondition => LogicInputCount,
+        NodeType.LatchCondition => 2,
+        _                       => 0,
     };
 
     // All condition-family node types behave as 2-port gates (port0=true, port1=false).
@@ -109,7 +131,8 @@ public class FlowNode {
         or NodeType.StatusCondition or NodeType.CooldownCondition
         or NodeType.TargetCondition or NodeType.PlayerCondition
         or NodeType.PartyCondition or NodeType.ActionHistoryCondition
-        or NodeType.GaugeCondition;
+        or NodeType.GaugeCondition or NodeType.LogicCondition
+        or NodeType.KeybindCondition or NodeType.ToggleCondition or NodeType.LatchCondition;
 
     public bool IsGate() => IsGate(Type);
 }

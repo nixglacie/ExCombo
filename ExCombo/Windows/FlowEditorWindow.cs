@@ -16,7 +16,8 @@ using LuminaAction = Lumina.Excel.Sheets.Action;
 namespace ExCombo.Windows;
 
 public class FlowEditorWindow : Window {
-    private readonly Configuration _config;
+    private readonly Configuration  _config;
+    private readonly NodeWikiWindow _wiki;
     private ComboFlow? _flow;
     public string? ActiveFlowId => _flow?.Id;
 
@@ -31,11 +32,13 @@ public class FlowEditorWindow : Window {
     private string? _wireFromNodeId;      // Mode A: source fixed, dragging to pick a target input
     private int     _wireFromPortIndex;
     private string? _wireToNodeId;        // Mode B: target fixed, dragging to pick a source output
+    private int     _wireToPortIndex;     // Mode B target input slot (>= 1 = Logic predicate slot)
 
     // Wire dropped on empty canvas → add-node menu open; the created node auto-connects.
     private string? _dropSrcNodeId;       // dangling source (connect new node as its target)
     private int     _dropSrcPort;
     private string? _dropDstNodeId;       // dangling target (connect new node as its source)
+    private int     _dropDstPort;         // dangling target input slot (Logic predicate slots >= 1)
     private string? _editNodeId;          // node being edited in the merged Action/Retarget modal
     private int     _editActiveTab;       // 0 = Action, 1 = Retarget
     // Staged edits — applied to the node only on OK, discarded on Cancel.
@@ -52,6 +55,15 @@ public class FlowEditorWindow : Window {
     private bool _pickerPvpTab;
     private string? _branchEditNodeId;
     private int     _branchEditCount;
+    private string? _logicEditNodeId;
+    private int     _logicEditCount;
+    private string  _logicEditExpr = "";
+    private string? _keybindEditNodeId;
+    private uint    _keybindEditVk;
+    private string? _toggleEditNodeId;
+    private string  _toggleEditName = "";
+    private bool    _toggleEditOn;
+    private bool    _toggleEditCopied;
     private Vector2 _contextMenuCanvasPos;
     private string?       _pendingDeleteNodeId;
     private string?       _confirmDeleteNodeId;    // awaiting single confirm-delete popup
@@ -89,6 +101,9 @@ public class FlowEditorWindow : Window {
     private bool _pendingOpenBranchEdit;
     private bool _pendingOpenCondEdit;
     private bool _pendingOpenNoteEdit;
+    private bool _pendingOpenLogicEdit;
+    private bool _pendingOpenKeybindEdit;
+    private bool _pendingOpenToggleEdit;
 
     private static readonly Dictionary<string, uint> _jobIconCache = new();
 
@@ -105,8 +120,8 @@ public class FlowEditorWindow : Window {
     private Vector2 _marqueeEnd;
 
     // Whole-node clones carry every field (future-proof against new FlowNode props).
-    private List<(string OrigId, FlowNode Node, float RelX, float RelY)>? _clipboardNodes;
-    private List<(string FromOrig, string ToOrig, int PortIdx)>?          _clipboardEdges;
+    private List<(string OrigId, FlowNode Node, float RelX, float RelY)>?  _clipboardNodes;
+    private List<(string FromOrig, string ToOrig, int PortIdx, int ToPortIdx)>? _clipboardEdges;
 
     private static readonly Vector2 NodeSize    = new(64f, 64f);
     private const           float   PortRadius  = 6f;
@@ -325,7 +340,8 @@ public class FlowEditorWindow : Window {
         n.Type == NodeType.Note
             ? n.NoteH
             : n.Type == NodeType.Branch || FlowNode.IsGate(n.Type)
-                ? MathF.Max(NodeSize.Y, BranchSlotH * n.OutputCount)
+                ? MathF.Max(NodeSize.Y, BranchSlotH * Math.Max(n.OutputCount,
+                      n.PredicateInputs() > 0 ? n.PredicateInputs() + 1 : 0))
                 : NodeSize.Y;
 
     private const float NoteMinW = 96f;
@@ -338,6 +354,38 @@ public class FlowEditorWindow : Window {
         n.Type == NodeType.Branch || FlowNode.IsGate(n.Type)
             ? canvasMin + _canvasOffset + new Vector2(n.X + NodeSize.X, (port + 0.5f) * BranchSlotH + n.Y)
             : canvasMin + _canvasOffset + new Vector2(n.X + NodeSize.X, n.Y + NodeSize.Y * 0.5f);
+
+    // Screen position of a node's input slot. Nodes with predicate inputs (Logic/Latch) stack
+    // their slots down the left side: slot 0 = flow input (top, grey ring), slots 1..N = predicate
+    // inputs beneath it at BranchSlotH pitch. Every other node type has just slot 0 at the left
+    // midpoint.
+    private Vector2 InputPortPos(FlowNode n, int slot, Vector2 canvasMin) =>
+        n.PredicateInputs() > 0
+            ? canvasMin + _canvasOffset + new Vector2(n.X, (slot + 0.5f) * BranchSlotH + n.Y)
+            : canvasMin + _canvasOffset + new Vector2(n.X, n.Y + NodeHeight(n) * 0.5f);
+
+    private static int InputSlotCount(FlowNode n) =>
+        n.PredicateInputs() > 0 ? n.PredicateInputs() + 1 : 1;
+
+    // The input slot of this node under a screen point, or null (Triggers/Notes have no input).
+    // Logic nodes have no visible flow-input port: with bodyAsFlowInput, any point on the body
+    // that isn't a predicate slot counts as the flow input (slot 0) — used when dropping a wire.
+    private int? FindInputSlotAt(FlowNode n, Vector2 pt, Vector2 canvasMin, float radiusMul = 3f,
+            bool bodyAsFlowInput = false) {
+        if (n.Type is NodeType.Trigger or NodeType.Note) return null;
+        if (n.PredicateInputs() > 0) {
+            for (var s = 0; s <= n.PredicateInputs(); s++)
+                if (Vector2.Distance(pt, InputPortPos(n, s, canvasMin)) < PortRadius * radiusMul)
+                    return s;
+            if (bodyAsFlowInput) {
+                var min = canvasMin + _canvasOffset + new Vector2(n.X, n.Y);
+                var max = min + new Vector2(NodeSize.X, NodeHeight(n));
+                if (pt.X >= min.X && pt.X <= max.X && pt.Y >= min.Y && pt.Y <= max.Y) return 0;
+            }
+            return null;
+        }
+        return Vector2.Distance(pt, InputPortPos(n, 0, canvasMin)) < PortRadius * radiusMul ? 0 : null;
+    }
 
     // The output port under a screen point, if any (Notes have no output).
     private (string NodeId, int Port)? FindOutputPortAt(Vector2 pt, Vector2 canvasMin) {
@@ -355,7 +403,7 @@ public class FlowEditorWindow : Window {
         ImGui.ColorConvertFloat4ToU32(new Vector4(r, g, b, a));
     private static uint Bg1 => Col(0.102f, 0.106f, 0.118f);
 
-    public FlowEditorWindow(Configuration config) : base("Flow Editor###ExComboEditor") {
+    public FlowEditorWindow(Configuration config, NodeWikiWindow wiki) : base("Flow Editor###ExComboEditor") {
         SizeConstraints = new WindowSizeConstraints {
             MinimumSize = new Vector2(400, 300),
             MaximumSize = new Vector2(9999, 9999),
@@ -363,6 +411,7 @@ public class FlowEditorWindow : Window {
         // Panning places node hit-boxes off-canvas; without this the window grows scrollable space.
         Flags = ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse;
         _config = config;
+        _wiki   = wiki;
     }
 
     public void Dispose() {
@@ -424,6 +473,11 @@ public class FlowEditorWindow : Window {
         ImGui.SetCursorScreenPos(slidersPos);
         if (ImGuiComponents.IconButton(FontAwesomeIcon.SlidersH, icoSz)) ImGui.OpenPopup("Flow settings##excFlowCfg");
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Flow tuning overrides");
+
+        // Node reference.
+        ImGui.SetCursorScreenPos(slidersPos + new Vector2(icoSz.X + 4f, 0f));
+        if (ImGuiComponents.IconButton(FontAwesomeIcon.Book, icoSz)) _wiki.Toggle();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Node wiki");
 
         ImGui.SetCursorPos(start);
         DrawFlowSettingsPopup();
@@ -594,13 +648,17 @@ public class FlowEditorWindow : Window {
             } else {
                 p1 = canvasMin + _canvasOffset + new Vector2(fn.X + NodeSize.X, fn.Y + NodeSize.Y * 0.5f);
             }
-            var p4  = canvasMin + _canvasOffset + new Vector2(tn.X, tn.Y + NodeHeight(tn) * 0.5f);
+            var p4  = InputPortPos(tn, edge.ToPortIndex, canvasMin);
             // Gate (condition) edges are colored by branch: port 0 = true (green), port 1 = false (red).
             // When the inspector is on, edges instead carry the downstream node's live state.
             uint  edgeCol;
-            float thick = 2f;
+            float thick = edge.ToPortIndex > 0 ? 1.6f : 2f;   // predicate wires read thinner
             if (inspect) {
-                edgeCol = InspectEdgeColor(_flow, fn, tn, edge);
+                edgeCol = edge.ToPortIndex > 0
+                    // Predicate wire: colored by the live signal it carries into the Logic input.
+                    ? (FlowExecutor.PredicateSignal(_flow, fn, edge.FromPortIndex)
+                        ? Col(0.30f, 0.85f, 0.30f, 0.9f) : Col(0.85f, 0.30f, 0.30f, 0.9f))
+                    : InspectEdgeColor(_flow, fn, tn, edge);
                 if (tn.Type == NodeType.Action && FlowExecutor.IsQueuedAction(_flow, tn.Id)) thick = 2.75f; // match node gold pulse weight
             } else {
                 edgeCol = FlowNode.IsGate(fn.Type)
@@ -629,7 +687,7 @@ public class FlowEditorWindow : Window {
                     if (ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
                         edgeToDelete = edge;                       // detach the edge
                         if (grabEnd) { _wireFromNodeId = edge.FromNodeId; _wireFromPortIndex = edge.FromPortIndex; }
-                        else         { _wireToNodeId   = edge.ToNodeId; }
+                        else         { _wireToNodeId   = edge.ToNodeId; _wireToPortIndex = edge.ToPortIndex; }
                     }
                 }
             }
@@ -655,9 +713,10 @@ public class FlowEditorWindow : Window {
                 var wireEnd = wireMouse;
                 foreach (var t in _flow.Nodes) {
                     if (t.Id == _wireFromNodeId) continue;
-                    if (t.Type == NodeType.Trigger) continue;
-                    var tip = canvasMin + _canvasOffset + new Vector2(t.X, t.Y + NodeHeight(t) * 0.5f);
-                    if (Vector2.Distance(wireMouse, tip) < PortRadius * 3f) { wireEnd = tip; break; }
+                    if (FindInputSlotAt(t, wireMouse, canvasMin, bodyAsFlowInput: true) is { } snapSlot) {
+                        wireEnd = InputPortPos(t, snapSlot, canvasMin);
+                        break;
+                    }
                 }
                 var wireCol = FlowNode.IsGate(wfn.Type)
                     ? (_wireFromPortIndex == 0 ? Col(0.30f, 0.80f, 0.30f, 0.6f) : Col(0.85f, 0.30f, 0.30f, 0.6f))
@@ -669,26 +728,39 @@ public class FlowEditorWindow : Window {
                 var connected = false;
                 foreach (var t in _flow.Nodes) {
                     if (t.Id == _wireFromNodeId) continue;
-                    if (t.Type == NodeType.Trigger) continue;
-                    var tip = canvasMin + _canvasOffset + new Vector2(t.X, t.Y + NodeHeight(t) * 0.5f);
-                    if (Vector2.Distance(wireMouse, tip) < PortRadius * 3f) {
-                        // prevent duplicate edge on same port
-                        if (!_flow.Edges.Exists(e => e.FromNodeId == _wireFromNodeId
-                                                   && e.FromPortIndex == _wireFromPortIndex
-                                                   && e.ToNodeId == t.Id)) {
-                            _flow.Edges.RemoveAll(e => e.FromNodeId == _wireFromNodeId
-                                                    && e.FromPortIndex == _wireFromPortIndex);
-                            _flow.Edges.Add(new FlowEdge {
-                                FromNodeId    = _wireFromNodeId,
-                                ToNodeId      = t.Id,
-                                FromPortIndex = _wireFromPortIndex,
-                            });
-                            FlowExecutor.InvalidateFlow(_flow.Id);
-                            Commit();
-                        }
+                    if (FindInputSlotAt(t, wireMouse, canvasMin, bodyAsFlowInput: true) is not { } slot) continue;
+
+                    // Predicate slots (>= 1) only accept condition/Logic outputs; other drops are swallowed.
+                    var srcNode = _flow.Nodes.Find(n => n.Id == _wireFromNodeId);
+                    if (slot >= 1 && (srcNode == null || !FlowNode.IsGate(srcNode.Type))) {
                         connected = true;
                         break;
                     }
+                    // prevent duplicate edge on same port/slot
+                    if (!_flow.Edges.Exists(e => e.FromNodeId == _wireFromNodeId
+                                               && e.FromPortIndex == _wireFromPortIndex
+                                               && e.ToNodeId == t.Id
+                                               && e.ToPortIndex == slot)) {
+                        if (slot == 0)
+                            // Flow edges: one outgoing flow edge per output port (predicate
+                            // fan-outs from the same port survive).
+                            _flow.Edges.RemoveAll(e => e.FromNodeId == _wireFromNodeId
+                                                    && e.FromPortIndex == _wireFromPortIndex
+                                                    && e.ToPortIndex == 0);
+                        else
+                            // Predicate edges: one wire per Logic input slot.
+                            _flow.Edges.RemoveAll(e => e.ToNodeId == t.Id && e.ToPortIndex == slot);
+                        _flow.Edges.Add(new FlowEdge {
+                            FromNodeId    = _wireFromNodeId,
+                            ToNodeId      = t.Id,
+                            FromPortIndex = _wireFromPortIndex,
+                            ToPortIndex   = slot,
+                        });
+                        FlowExecutor.InvalidateFlow(_flow.Id);
+                        Commit();
+                    }
+                    connected = true;
+                    break;
                 }
                 // Dropped on empty space → offer the add-node menu; the new node wires as the target.
                 if (!connected) {
@@ -707,7 +779,7 @@ public class FlowEditorWindow : Window {
             if (ttn == null) {
                 _wireToNodeId = null;
             } else {
-                var p4b   = canvasMin + _canvasOffset + new Vector2(ttn.X, ttn.Y + NodeHeight(ttn) * 0.5f);
+                var p4b   = InputPortPos(ttn, _wireToPortIndex, canvasMin);
                 var hit   = FindOutputPortAt(mouse2, canvasMin);
                 var start = hit is { } h && h.NodeId != _wireToNodeId
                     ? OutputPortPos(_flow.Nodes.Find(n => n.Id == h.NodeId)!, h.Port, canvasMin)
@@ -716,19 +788,31 @@ public class FlowEditorWindow : Window {
 
                 if (ImGui.IsMouseReleased(ImGuiMouseButton.Left)) {
                     if (hit is { } hh && hh.NodeId != _wireToNodeId) {
-                        if (!_flow.Edges.Exists(e => e.FromNodeId == hh.NodeId && e.FromPortIndex == hh.Port && e.ToNodeId == _wireToNodeId)) {
-                            _flow.Edges.RemoveAll(e => e.FromNodeId == hh.NodeId && e.FromPortIndex == hh.Port);
-                            _flow.Edges.Add(new FlowEdge { FromNodeId = hh.NodeId, ToNodeId = _wireToNodeId, FromPortIndex = hh.Port });
+                        // Predicate slots only accept condition/Logic outputs.
+                        var srcNode = _flow.Nodes.Find(n => n.Id == hh.NodeId);
+                        var okSrc   = _wireToPortIndex == 0 || (srcNode != null && FlowNode.IsGate(srcNode.Type));
+                        if (okSrc && !_flow.Edges.Exists(e => e.FromNodeId == hh.NodeId && e.FromPortIndex == hh.Port
+                                                           && e.ToNodeId == _wireToNodeId && e.ToPortIndex == _wireToPortIndex)) {
+                            if (_wireToPortIndex == 0)
+                                _flow.Edges.RemoveAll(e => e.FromNodeId == hh.NodeId && e.FromPortIndex == hh.Port && e.ToPortIndex == 0);
+                            else
+                                _flow.Edges.RemoveAll(e => e.ToNodeId == _wireToNodeId && e.ToPortIndex == _wireToPortIndex);
+                            _flow.Edges.Add(new FlowEdge {
+                                FromNodeId = hh.NodeId, ToNodeId = _wireToNodeId,
+                                FromPortIndex = hh.Port, ToPortIndex = _wireToPortIndex,
+                            });
                             FlowExecutor.InvalidateFlow(_flow.Id);
                             Commit();
                         }
                     } else {
                         // Dropped on empty space → add-node menu; the new node wires as the source.
                         _dropDstNodeId        = _wireToNodeId;
+                        _dropDstPort          = _wireToPortIndex;
                         _contextMenuCanvasPos = mouse2 - canvasMin - _canvasOffset;
                         ImGui.OpenPopup("##canvas_ctx");
                     }
-                    _wireToNodeId = null;
+                    _wireToNodeId    = null;
+                    _wireToPortIndex = 0;
                 }
             }
         }
@@ -817,17 +901,22 @@ public class FlowEditorWindow : Window {
             var isTrigger   = node.Type == NodeType.Trigger;
             var isBranch    = node.Type == NodeType.Branch;
             var isGate      = FlowNode.IsGate(node.Type);
+            var isLogic     = node.Type == NodeType.LogicCondition;
+            var isKeybind   = node.Type == NodeType.KeybindCondition;
+            var isToggle    = node.Type == NodeType.ToggleCondition;
+            var isLatch     = node.Type == NodeType.LatchCondition;
             var isJobCond   = node.Type == NodeType.Condition;
             var isNote      = node.Type == NodeType.Note;
             var nodeH       = NodeHeight(node);
             var nodeW       = NodeWidthOf(node);
             var sp          = canvasMin + _canvasOffset + new Vector2(node.X, node.Y);
-            var inPort      = sp + new Vector2(0f, nodeH * 0.5f);
+            var inPort      = InputPortPos(node, 0, canvasMin);
 
-            // Input port is grabbable to start a wire the other way (input → output, Mode B).
-            var overInStart = !isTrigger && !isNote
-                && _wireFromNodeId == null && _wireToNodeId == null
-                && Vector2.Distance(mouse2, inPort) < PortRadius * 2f;
+            // Input slots are grabbable to start a wire the other way (input → output, Mode B).
+            // Logic nodes expose extra predicate slots below the flow input.
+            var overInSlot  = _wireFromNodeId == null && _wireToNodeId == null
+                ? FindInputSlotAt(node, mouse2, canvasMin, 2f) : null;
+            var overInStart = overInSlot != null;
 
             // ── Output port hover detection ───────────────────────────────
             bool overOutPort    = false;
@@ -923,14 +1012,20 @@ public class FlowEditorWindow : Window {
                 _wireFromPortIndex = (isBranch || isGate) ? overOutPortIdx : 0;
             }
             // Input → output: grab an input port to pick a source (Mode B); same node is blocked.
-            if (overInStart && ImGui.IsMouseClicked(ImGuiMouseButton.Left))
-                _wireToNodeId = node.Id;
+            if (overInStart && ImGui.IsMouseClicked(ImGuiMouseButton.Left)) {
+                _wireToNodeId    = node.Id;
+                _wireToPortIndex = overInSlot!.Value;
+            }
 
             if (nodeHovered && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left)) {
-                if (isBranch)    OpenBranchEdit(node.Id, node.OutputCount);
-                else if (isGate) OpenConditionEdit(node.Id);
-                else if (isNote) OpenNoteEdit(node.Id);
-                else             OpenPicker(node.Id);
+                if (isBranch)       OpenBranchEdit(node.Id, node.OutputCount);
+                else if (isLogic)   OpenLogicEdit(node.Id);
+                else if (isKeybind) OpenKeybindEdit(node.Id);
+                else if (isToggle)  OpenToggleEdit(node.Id);
+                else if (isLatch)   { /* nothing to configure */ }
+                else if (isGate)    OpenConditionEdit(node.Id);
+                else if (isNote)    OpenNoteEdit(node.Id);
+                else                OpenPicker(node.Id);
             }
 
             if (nodeHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
@@ -1062,7 +1157,9 @@ public class FlowEditorWindow : Window {
                     : nodeHovered || nodeActive
                         ? condAccent
                         : Style.NodeColU32(node.Type, 0.5f);
-                dl.AddRectFilled(sp, sp + new Vector2(NodeSize.X, nodeH), Col(0.12f, 0.08f, 0.03f), 6f);
+                dl.AddRectFilled(sp, sp + new Vector2(NodeSize.X, nodeH),
+                    isLogic || isLatch || isKeybind || isToggle
+                        ? Col(0.13f, 0.12f, 0.04f) : Col(0.12f, 0.08f, 0.03f), 6f);
 
                 // Body icon: job gauge (legacy + GaugeCondition) = job icon; Status/Cooldown = picked
                 // status/action icon; Target/Player/Party/Action = a category glyph.
@@ -1086,20 +1183,30 @@ public class FlowEditorWindow : Window {
                         var ioff  = new Vector2((NodeSize.X - isz.X) * 0.5f, (nodeH - isz.Y) * 0.5f + iyAdj);
                         DrawHelpers.DrawIcon(dl, tex, sp + ioff, isz, 1f, 6f);
                     }
-                } else if (node.Type is NodeType.TargetCondition or NodeType.PlayerCondition or NodeType.PartyCondition or NodeType.ActionHistoryCondition) {
+                } else if (node.Type is NodeType.TargetCondition or NodeType.PlayerCondition or NodeType.PartyCondition
+                        or NodeType.ActionHistoryCondition or NodeType.LogicCondition
+                        or NodeType.KeybindCondition or NodeType.ToggleCondition or NodeType.LatchCondition) {
                     var glyph = node.Type switch {
                         NodeType.TargetCondition => FontAwesomeIcon.Crosshairs,
                         NodeType.PlayerCondition => FontAwesomeIcon.User,
                         NodeType.ActionHistoryCondition => FontAwesomeIcon.History,
+                        NodeType.LogicCondition  => FontAwesomeIcon.Microchip,
+                        NodeType.KeybindCondition => FontAwesomeIcon.Keyboard,
+                        NodeType.ToggleCondition => node.ToggleOn ? FontAwesomeIcon.ToggleOn : FontAwesomeIcon.ToggleOff,
+                        NodeType.LatchCondition  => FontAwesomeIcon.Lock,
                         _                        => FontAwesomeIcon.Users,
                     };
+                    // Toggle glyph reads its state: full node color when ON, dim grey when OFF.
+                    var glyphCol = isToggle && !node.ToggleOn
+                        ? Col(0.55f, 0.55f, 0.58f, 0.7f)
+                        : Style.NodeColU32(node.Type, 0.85f);
                     var gstr = glyph.ToIconString();
                     using (IconFontLarge.Push()) {
                         var font = ImGui.GetFont();
                         var sz   = ImGui.GetFontSize();
                         var gsz  = ImGui.CalcTextSize(gstr);
                         dl.AddText(font, sz, sp + new Vector2((NodeSize.X - gsz.X) * 0.5f, (nodeH - gsz.Y) * 0.5f),
-                            Style.NodeColU32(node.Type, 0.85f), gstr);
+                            glyphCol, gstr);
                     }
                 }
 
@@ -1115,15 +1222,33 @@ public class FlowEditorWindow : Window {
                 }
 
                 var condLabel      = GateNodeLabel(node);
+                // Invalid logic expression → red warning label instead of the orange accent.
+                var condLabelCol   = condAccent;
+                if (isLogic) {
+                    var ast = LogicExpr.Cached(node.LogicExpr is "" ? "1 AND 2" : node.LogicExpr);
+                    if (ast == null || ast.MaxInput > node.LogicInputCount) condLabelCol = Col(1f, 0.35f, 0.35f);
+                }
                 var condLabelWidth = ImGui.CalcTextSize(condLabel).X;
                 var condLabelPos   = sp + new Vector2((NodeSize.X - condLabelWidth) * 0.5f, -16f);
-                DrawHelpers.DrawText(dl, condLabelPos, condLabel, condAccent, true);
+                DrawHelpers.DrawText(dl, condLabelPos, condLabel, condLabelCol, true);
 
-                // Input port
-                var overInPort = overInStart || (_wireFromNodeId != null && _wireFromNodeId != node.Id
-                    && Vector2.Distance(mouse2, inPort) < PortRadius * 3f);
-                dl.AddCircleFilled(inPort, PortRadius, overInPort ? Col(0.35f, 0.65f, 1f) : Col(0.25f, 0.25f, 0.35f));
-                dl.AddCircle(inPort, PortRadius, overInPort ? Col(0.55f, 0.80f, 1f) : Col(0.45f, 0.45f, 0.60f), 12, 1.5f);
+                // Input slots down the left side: slot 0 = flow input (grey ring, same as other
+                // nodes), slots 1..N = numbered predicate inputs (node-colored rings). Flow wires
+                // can also be dropped anywhere on the body.
+                for (var s = 0; s < InputSlotCount(node); s++) {
+                    var slotPos  = InputPortPos(node, s, canvasMin);
+                    var overSlot = overInSlot == s || (_wireFromNodeId != null && _wireFromNodeId != node.Id
+                        && Vector2.Distance(mouse2, slotPos) < PortRadius * 3f);
+                    dl.AddCircleFilled(slotPos, PortRadius, overSlot ? Col(0.35f, 0.65f, 1f) : Col(0.25f, 0.25f, 0.35f));
+                    var ringCol = overSlot ? Col(0.55f, 0.80f, 1f)
+                                : s == 0   ? Col(0.45f, 0.45f, 0.60f)
+                                           : Style.NodeColU32(node.Type, 0.9f);   // predicate slot
+                    dl.AddCircle(slotPos, PortRadius, ringCol, 12, 1.5f);
+                    if (s >= 1)
+                        DrawHelpers.DrawText(dl, slotPos + new Vector2(PortRadius + 4f, -8f),
+                            isLatch ? (s == 1 ? "S" : "R") : s.ToString(),
+                            Style.NodeColU32(node.Type, 0.8f), false);
+                }
 
                 // Output ports: port 0 = true (green), port 1 = false (red)
                 for (var p = 0; p < node.OutputCount; p++) {
@@ -1275,7 +1400,24 @@ public class FlowEditorWindow : Window {
 
             // ── Context menu ──────────────────────────────────────────────
             if (ImGui.BeginPopup($"node_ctx_{node.Id}")) {
-                if (isGate) {
+                if (isLogic) {
+                    if (IconMenuItem(FontAwesomeIcon.Microchip, "Edit Logic", Style.NodeColU32(node.Type))) OpenLogicEdit(node.Id);
+                } else if (isKeybind) {
+                    if (IconMenuItem(FontAwesomeIcon.Keyboard, "Edit Keybind", Style.NodeColU32(node.Type))) OpenKeybindEdit(node.Id);
+                } else if (isToggle) {
+                    if (IconMenuItem(node.ToggleOn ? FontAwesomeIcon.ToggleOff : FontAwesomeIcon.ToggleOn,
+                            node.ToggleOn ? "Switch Off" : "Switch On", Style.NodeColU32(node.Type))) {
+                        node.ToggleOn = !node.ToggleOn;
+                        FlowExecutor.InvalidateFlow(_flow.Id);
+                        Commit();
+                    }
+                    if (IconMenuItem(FontAwesomeIcon.Edit, "Edit Toggle", Style.NodeColU32(node.Type))) OpenToggleEdit(node.Id);
+                    if (node.ActionLabel != "" && IconMenuItem(FontAwesomeIcon.Copy, "Copy Command", Col(0.45f, 0.80f, 0.85f)))
+                        Helpers.ClipboardHelper.SetText(ToggleCommand(node.ActionLabel));
+                } else if (isLatch) {
+                    if (IconMenuItem(FontAwesomeIcon.Unlock, "Reset Latch State", Style.NodeColU32(node.Type)))
+                        FlowExecutor.ResetLatch(_flow, node.Id);
+                } else if (isGate) {
                     if (IconMenuItem(FontAwesomeIcon.Filter, "Edit Condition", Style.NodeColU32(node.Type))) OpenConditionEdit(node.Id);
                 } else if (isBranch) {
                     if (IconMenuItem(FontAwesomeIcon.List,   "Edit Outputs", Style.NodeColU32(NodeType.Branch))) OpenBranchEdit(node.Id, node.OutputCount);
@@ -1351,7 +1493,7 @@ public class FlowEditorWindow : Window {
                 }
                 foreach (var e in _flow.Edges) {
                     if (_selectedNodeIds.Contains(e.FromNodeId) && _selectedNodeIds.Contains(e.ToNodeId))
-                        _clipboardEdges.Add((e.FromNodeId, e.ToNodeId, e.FromPortIndex));
+                        _clipboardEdges.Add((e.FromNodeId, e.ToNodeId, e.FromPortIndex, e.ToPortIndex));
                 }
                 ImGui.CloseCurrentPopup();
             }
@@ -1427,11 +1569,11 @@ public class FlowEditorWindow : Window {
 
         if (!anyNodeRightClicked && canvasHovered && ImGui.IsMouseClicked(ImGuiMouseButton.Right)) {
             _contextMenuCanvasPos = mouse2 - canvasMin - _canvasOffset;
-            _dropSrcNodeId = null; _dropDstNodeId = null;   // plain right-click: no dangling wire
+            _dropSrcNodeId = null; _dropDstNodeId = null; _dropDstPort = 0;   // plain right-click: no dangling wire
             ImGui.OpenPopup("##canvas_ctx");
         }
         var ctxOpen = ImGui.BeginPopup("##canvas_ctx");
-        if (!ctxOpen) { _dropSrcNodeId = null; _dropDstNodeId = null; }   // menu dismissed → drop the dangling wire
+        if (!ctxOpen) { _dropSrcNodeId = null; _dropDstNodeId = null; _dropDstPort = 0; }   // menu dismissed → drop the dangling wire
         if (ctxOpen) {
             if (IconMenuItem(FontAwesomeIcon.Bolt,        "Add Trigger",   Style.NodeColU32(NodeType.Trigger))) AddNode(NodeType.Trigger);
             if (IconMenuItem(FontAwesomeIcon.Magic,       "Add Action",    Style.NodeColU32(NodeType.Action))) AddNode(NodeType.Action);
@@ -1445,6 +1587,14 @@ public class FlowEditorWindow : Window {
                 if (IconMenuItem(FontAwesomeIcon.User,      "Player",     condCol)) AddGateNode(NodeType.PlayerCondition);
                 if (IconMenuItem(FontAwesomeIcon.Users,     "Party",      condCol)) AddGateNode(NodeType.PartyCondition);
                 if (IconMenuItem(FontAwesomeIcon.History,   "Action History", condCol)) AddGateNode(NodeType.ActionHistoryCondition);
+                ImGui.EndMenu();
+            }
+            var logicCol = Style.NodeColU32(NodeType.LogicCondition);
+            if (IconBeginMenu(FontAwesomeIcon.Microchip, "Add Logic", logicCol)) {
+                if (IconMenuItem(FontAwesomeIcon.Microchip, "Expression", logicCol)) AddLogicNode();
+                if (IconMenuItem(FontAwesomeIcon.Lock,      "Latch",      logicCol)) AddLatchNode();
+                if (IconMenuItem(FontAwesomeIcon.Keyboard,  "Keybind",    logicCol)) AddGateNode(NodeType.KeybindCondition);
+                if (IconMenuItem(FontAwesomeIcon.ToggleOn,  "Toggle",     logicCol)) AddGateNode(NodeType.ToggleCondition);
                 ImGui.EndMenu();
             }
             if (IconMenuItem(FontAwesomeIcon.StickyNote,  "Add Note",      Style.NodeColU32(NodeType.Note))) AddNoteNode();
@@ -1468,9 +1618,9 @@ public class FlowEditorWindow : Window {
                         idMap[origId] = nn.Id;
                         newNodes.Add(nn);
                     }
-                    foreach (var (fromOrig, toOrig, portIdx) in _clipboardEdges!) {
+                    foreach (var (fromOrig, toOrig, portIdx, toPortIdx) in _clipboardEdges!) {
                         if (idMap.TryGetValue(fromOrig, out var fromNew) && idMap.TryGetValue(toOrig, out var toNew))
-                            _flow.Edges.Add(new FlowEdge { FromNodeId = fromNew, ToNodeId = toNew, FromPortIndex = portIdx });
+                            _flow.Edges.Add(new FlowEdge { FromNodeId = fromNew, ToNodeId = toNew, FromPortIndex = portIdx, ToPortIndex = toPortIdx });
                     }
                     _selectedNodeIds.Clear();
                     foreach (var nn in newNodes) {
@@ -1494,12 +1644,18 @@ public class FlowEditorWindow : Window {
         if (_pendingOpenBranchEdit) { ImGui.OpenPopup("Priority Outputs##branchedit"); _pendingOpenBranchEdit = false; }
         if (_pendingOpenCondEdit)   { ImGui.OpenPopup("Edit Condition##condedit");   _pendingOpenCondEdit   = false; }
         if (_pendingOpenNoteEdit)   { ImGui.OpenPopup("Edit Note##noteedit");        _pendingOpenNoteEdit   = false; }
+        if (_pendingOpenLogicEdit)   { ImGui.OpenPopup("Edit Logic##logicedit");     _pendingOpenLogicEdit   = false; }
+        if (_pendingOpenKeybindEdit) { ImGui.OpenPopup("Edit Keybind##keybindedit"); _pendingOpenKeybindEdit = false; }
+        if (_pendingOpenToggleEdit)  { ImGui.OpenPopup("Edit Toggle##toggleedit");   _pendingOpenToggleEdit  = false; }
 
         // ── Modals ────────────────────────────────────────────────────────
         DrawNodeEdit();
         DrawBranchEdit();
         DrawConditionEdit();
         DrawNoteEdit();
+        DrawLogicEdit();
+        DrawKeybindEdit();
+        DrawToggleEdit();
 
         ImGui.PopStyleVar();   // WindowPadding pushed at the top of Draw
     }
@@ -1527,26 +1683,65 @@ public class FlowEditorWindow : Window {
         _flow!.Nodes.Add(node);
         TryConnectDropped(node);
         Commit();
-        OpenConditionEdit(node.Id);
+        // Keybind/Toggle have their own small modals; everything else uses the condition editor.
+        if      (type == NodeType.KeybindCondition) OpenKeybindEdit(node.Id);
+        else if (type == NodeType.ToggleCondition)  OpenToggleEdit(node.Id);
+        else                                        OpenConditionEdit(node.Id);
+    }
+
+    private void AddLatchNode() {
+        var node = new FlowNode {
+            Type        = NodeType.LatchCondition,
+            OutputCount = 2,
+            X           = MathF.Round((_contextMenuCanvasPos.X - NodeSize.X * 0.5f) / GridStep) * GridStep,
+            Y           = MathF.Round((_contextMenuCanvasPos.Y - NodeSize.Y * 0.5f) / GridStep) * GridStep,
+        };
+        _flow!.Nodes.Add(node);
+        TryConnectDropped(node);
+        Commit();
+    }
+
+    private void AddLogicNode() {
+        var node = new FlowNode {
+            Type            = NodeType.LogicCondition,
+            OutputCount     = 2,
+            LogicInputCount = 2,
+            LogicExpr       = "1 AND 2",
+            X               = MathF.Round((_contextMenuCanvasPos.X - NodeSize.X * 0.5f) / GridStep) * GridStep,
+            Y               = MathF.Round((_contextMenuCanvasPos.Y - NodeSize.Y * 0.5f) / GridStep) * GridStep,
+        };
+        _flow!.Nodes.Add(node);
+        TryConnectDropped(node);
+        Commit();
+        OpenLogicEdit(node.Id);
     }
 
     // Wire a node just created from the drop-menu into the dangling connection, if any.
     private void TryConnectDropped(FlowNode nn) {
         if (_dropSrcNodeId != null) {
             if (nn.Type != NodeType.Trigger && nn.Type != NodeType.Note) {
-                _flow!.Edges.RemoveAll(e => e.FromNodeId == _dropSrcNodeId && e.FromPortIndex == _dropSrcPort);
+                _flow!.Edges.RemoveAll(e => e.FromNodeId == _dropSrcNodeId && e.FromPortIndex == _dropSrcPort && e.ToPortIndex == 0);
                 _flow.Edges.Add(new FlowEdge { FromNodeId = _dropSrcNodeId, ToNodeId = nn.Id, FromPortIndex = _dropSrcPort });
                 FlowExecutor.InvalidateFlow(_flow.Id);
             }
             _dropSrcNodeId = null;
         }
         if (_dropDstNodeId != null) {
-            if (nn.Type != NodeType.Note && nn.Id != _dropDstNodeId) {
-                _flow!.Edges.RemoveAll(e => e.FromNodeId == nn.Id && e.FromPortIndex == 0);
-                _flow.Edges.Add(new FlowEdge { FromNodeId = nn.Id, ToNodeId = _dropDstNodeId, FromPortIndex = 0 });
+            // Predicate slots (>= 1) only accept condition/Logic sources; flow slot takes anything but Notes.
+            var okSrc = _dropDstPort == 0 || FlowNode.IsGate(nn.Type);
+            if (nn.Type != NodeType.Note && nn.Id != _dropDstNodeId && okSrc) {
+                if (_dropDstPort == 0)
+                    _flow!.Edges.RemoveAll(e => e.FromNodeId == nn.Id && e.FromPortIndex == 0 && e.ToPortIndex == 0);
+                else
+                    _flow!.Edges.RemoveAll(e => e.ToNodeId == _dropDstNodeId && e.ToPortIndex == _dropDstPort);
+                _flow.Edges.Add(new FlowEdge {
+                    FromNodeId = nn.Id, ToNodeId = _dropDstNodeId,
+                    FromPortIndex = 0, ToPortIndex = _dropDstPort,
+                });
                 FlowExecutor.InvalidateFlow(_flow.Id);
             }
             _dropDstNodeId = null;
+            _dropDstPort   = 0;
         }
     }
 
@@ -1560,10 +1755,29 @@ public class FlowEditorWindow : Window {
         NodeType.PartyCondition    => "Party",
         NodeType.ActionHistoryCondition => "Action",
         NodeType.GaugeCondition    => "Gauge",
+        NodeType.LogicCondition    => "Logic",
+        NodeType.KeybindCondition  => "Keybind",
+        NodeType.ToggleCondition   => "Toggle",
+        NodeType.LatchCondition    => "Latch",
         _ => "Condition",
     };
 
+    // Display name of the Keybind gate's chosen key.
+    internal static string KeyName(uint vk) => vk switch {
+        16 => "Shift", 17 => "Ctrl", 18 => "Alt",
+        0  => "Keybind",
+        _  => ((Dalamud.Game.ClientState.Keys.VirtualKey)vk).ToString(),
+    };
+
     private static string GateNodeLabel(FlowNode n) {
+        if (n.Type == NodeType.LogicCondition)
+            return n.LogicExpr is "" ? "Logic" : n.LogicExpr;
+        if (n.Type == NodeType.KeybindCondition)
+            return n.CheckParamId == 0 ? "Keybind" : $"Hold {KeyName(n.CheckParamId)}";
+        if (n.Type == NodeType.ToggleCondition)
+            return n.ActionLabel is "" ? "Toggle" : n.ActionLabel;
+        if (n.Type == NodeType.LatchCondition)
+            return "Latch";
         var op  = ((CompareOp)n.ConditionCompareOp).ToLabel();
         if (n.Type == NodeType.Condition)
             return n.ConditionField != "" ? $"{n.ConditionField} {op} {n.ConditionCompareVal}" : "Job Condition";
@@ -1698,6 +1912,228 @@ public class FlowEditorWindow : Window {
         ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
         if (ImGui.Button("Cancel", new Vector2(btnW, 0f))) {
             _branchEditNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.PopStyleVar();
+
+        ImGui.EndPopup();
+    }
+
+    private void OpenLogicEdit(string nodeId) {
+        var node = _flow!.Nodes.Find(n => n.Id == nodeId);
+        if (node == null) return;
+        _logicEditNodeId      = nodeId;
+        _logicEditCount       = node.LogicInputCount;
+        _logicEditExpr        = node.LogicExpr is "" ? "1 AND 2" : node.LogicExpr;
+        _pendingOpenLogicEdit = true;
+    }
+
+    private void DrawLogicEdit() {
+        if (_logicEditNodeId == null) return;
+
+        if (!ImGui.BeginPopupModal("Edit Logic##logicedit",
+                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.AlwaysAutoResize)) return;
+
+        ImGui.TextDisabled("Inputs");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(120f);
+        ImGui.InputInt("##logicincount", ref _logicEditCount);
+        if (_logicEditCount < 2) _logicEditCount = 2;
+        if (_logicEditCount > 8) _logicEditCount = 8;
+
+        ImGui.Spacing();
+        ImGui.TextDisabled("Expression");
+        ImGui.SetNextItemWidth(320f);
+        ImGui.InputText("##logicexpr", ref _logicEditExpr, 256);
+
+        // Live validation.
+        var ast = LogicExpr.Parse(_logicEditExpr, out var parseError);
+        var err = ast == null                       ? parseError
+                : ast.MaxInput > _logicEditCount    ? $"expression references input {ast.MaxInput}, but only {_logicEditCount} inputs exist"
+                : "";
+        if (err.Length > 0) ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), err);
+        else                ImGui.TextColored(new Vector4(0.4f, 0.9f, 0.4f, 1f), "expression is valid");
+
+        ImGui.PushTextWrapPos(360f);
+        ImGui.TextDisabled("Inputs are the numbered ports on the node's left, fed by condition (or "
+                         + "other Logic) outputs — wire from a false/red port to feed the negated "
+                         + "value. Operators: AND OR NOT XOR or && || ! ^, with parentheses. "
+                         + "Unwired inputs count as false.");
+        ImGui.PopTextWrapPos();
+        ImGui.Spacing();
+
+        var btnW = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+
+        var canSave = err.Length == 0;
+        if (!canSave) ImGui.BeginDisabled();
+        ImGui.PushStyleColor(ImGuiCol.Button,        Style.AccentColor);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Style.AccentHover);
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.AccentActive);
+        ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.102f, 0.106f, 0.118f, 1f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
+        if (ImGui.Button("OK", new Vector2(btnW, 0f))) {
+            var node = _flow!.Nodes.Find(n => n.Id == _logicEditNodeId);
+            if (node != null) {
+                // Drop predicate wires into slots that no longer exist.
+                _flow.Edges.RemoveAll(e => e.ToNodeId == node.Id && e.ToPortIndex > _logicEditCount);
+                node.LogicInputCount = _logicEditCount;
+                node.LogicExpr       = _logicEditExpr.Trim();
+                FlowExecutor.InvalidateFlow(_flow.Id);
+                Commit();
+            }
+            _logicEditNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.PopStyleVar();
+        ImGui.PopStyleColor(4);
+        if (!canSave) ImGui.EndDisabled();
+
+        ImGui.SameLine();
+
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
+        if (ImGui.Button("Cancel", new Vector2(btnW, 0f))) {
+            _logicEditNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.PopStyleVar();
+
+        ImGui.EndPopup();
+    }
+
+    private void OpenKeybindEdit(string nodeId) {
+        var node = _flow!.Nodes.Find(n => n.Id == nodeId);
+        if (node == null) return;
+        _keybindEditNodeId      = nodeId;
+        _keybindEditVk          = node.CheckParamId != 0 ? node.CheckParamId : 16;   // default Shift
+        _pendingOpenKeybindEdit = true;
+    }
+
+    private void DrawKeybindEdit() {
+        if (_keybindEditNodeId == null) return;
+
+        if (!ImGui.BeginPopupModal("Edit Keybind##keybindedit",
+                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.AlwaysAutoResize)) return;
+
+        ImGui.TextDisabled("Key");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(160f);
+        if (ImGui.BeginCombo("##keybindkey", KeyName(_keybindEditVk))) {
+            foreach (var vk in new uint[] { 16, 17, 18 }) {
+                if (ImGui.Selectable(KeyName(vk), _keybindEditVk == vk)) _keybindEditVk = vk;
+            }
+            ImGui.EndCombo();
+        }
+
+        ImGui.PushTextWrapPos(320f);
+        ImGui.TextDisabled("The gate is true while the key is held (game window must be focused).");
+        ImGui.PopTextWrapPos();
+        ImGui.Spacing();
+
+        var btnW = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+
+        ImGui.PushStyleColor(ImGuiCol.Button,        Style.AccentColor);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Style.AccentHover);
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.AccentActive);
+        ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.102f, 0.106f, 0.118f, 1f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
+        if (ImGui.Button("OK", new Vector2(btnW, 0f))) {
+            var node = _flow!.Nodes.Find(n => n.Id == _keybindEditNodeId);
+            if (node != null) {
+                node.CheckParamId = _keybindEditVk;
+                FlowExecutor.InvalidateFlow(_flow.Id);
+                Commit();
+            }
+            _keybindEditNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.PopStyleVar();
+        ImGui.PopStyleColor(4);
+
+        ImGui.SameLine();
+
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
+        if (ImGui.Button("Cancel", new Vector2(btnW, 0f))) {
+            _keybindEditNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.PopStyleVar();
+
+        ImGui.EndPopup();
+    }
+
+    private void OpenToggleEdit(string nodeId) {
+        var node = _flow!.Nodes.Find(n => n.Id == nodeId);
+        if (node == null) return;
+        _toggleEditNodeId      = nodeId;
+        _toggleEditName        = node.ActionLabel;
+        _toggleEditOn          = node.ToggleOn;
+        _toggleEditCopied      = false;
+        _pendingOpenToggleEdit = true;
+    }
+
+    private string ToggleCommand(string name) => $"/excombo toggle {name.Trim()}";
+
+    private void DrawToggleEdit() {
+        if (_toggleEditNodeId == null) return;
+
+        if (!ImGui.BeginPopupModal("Edit Toggle##toggleedit",
+                ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.AlwaysAutoResize)) return;
+
+        ImGui.TextDisabled("Name");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(200f);
+        ImGui.InputText("##togglename", ref _toggleEditName, 64);
+        ImGui.Checkbox("On", ref _toggleEditOn);
+
+        // One-click macro command for a hotbar macro.
+        ImGui.Spacing();
+        var cmd = ToggleCommand(_toggleEditName is "" ? "<name>" : _toggleEditName);
+        ImGui.TextDisabled(cmd);
+        var canCopy = _toggleEditName.Trim().Length > 0;
+        if (!canCopy) ImGui.BeginDisabled();
+        if (ImGuiComponents.IconButton(FontAwesomeIcon.Copy, new Vector2(26f, 24f))) {
+            _toggleEditCopied = Helpers.ClipboardHelper.SetText(ToggleCommand(_toggleEditName));
+        }
+        if (!canCopy) ImGui.EndDisabled();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("Copy command — paste it into a game macro");
+        if (_toggleEditCopied) {
+            ImGui.SameLine();
+            ImGui.TextColored(new Vector4(0.4f, 0.9f, 0.4f, 1f), "copied!");
+        }
+
+        ImGui.PushTextWrapPos(320f);
+        ImGui.TextDisabled("Flip it here, via right-click → Switch On/Off, or with the command "
+                         + "above (put it in a macro for a hotbar button). The state persists "
+                         + "across reloads.");
+        ImGui.PopTextWrapPos();
+        ImGui.Spacing();
+
+        var btnW = (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().ItemSpacing.X) * 0.5f;
+
+        ImGui.PushStyleColor(ImGuiCol.Button,        Style.AccentColor);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Style.AccentHover);
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.AccentActive);
+        ImGui.PushStyleColor(ImGuiCol.Text,          new Vector4(0.102f, 0.106f, 0.118f, 1f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
+        if (ImGui.Button("OK", new Vector2(btnW, 0f))) {
+            var node = _flow!.Nodes.Find(n => n.Id == _toggleEditNodeId);
+            if (node != null) {
+                node.ActionLabel = _toggleEditName.Trim();
+                node.ToggleOn    = _toggleEditOn;
+                FlowExecutor.InvalidateFlow(_flow.Id);
+                Commit();
+            }
+            _toggleEditNodeId = null;
+            ImGui.CloseCurrentPopup();
+        }
+        ImGui.PopStyleVar();
+        ImGui.PopStyleColor(4);
+
+        ImGui.SameLine();
+
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(0f, 5f));
+        if (ImGui.Button("Cancel", new Vector2(btnW, 0f))) {
+            _toggleEditNodeId = null;
             ImGui.CloseCurrentPopup();
         }
         ImGui.PopStyleVar();

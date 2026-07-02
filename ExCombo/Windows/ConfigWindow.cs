@@ -201,6 +201,7 @@ public class ConfigWindow : Window {
         NodeColorRow("Action",    _config.NodeColorAction,    a => { _config.NodeColorAction    = a; _config.Save(); });
         NodeColorRow("Priority",  _config.NodeColorBranch,    a => { _config.NodeColorBranch    = a; _config.Save(); });
         NodeColorRow("Condition", _config.NodeColorCondition, a => { _config.NodeColorCondition = a; _config.Save(); });
+        NodeColorRow("Logic",     _config.NodeColorLogic,     a => { _config.NodeColorLogic     = a; _config.Save(); });
         NodeColorRow("Note",      _config.NodeColorNote,      a => { _config.NodeColorNote      = a; _config.Save(); });
         NodeColorRow("Combo group", _config.ComboGroupColor,  a => { _config.ComboGroupColor    = a; _config.Save(); });
 
@@ -221,6 +222,7 @@ public class ConfigWindow : Window {
             _config.NodeColorAction    = new[] { 0.455f, 0.765f, 1.000f };
             _config.NodeColorBranch    = new[] { 0.700f, 0.400f, 1.000f };
             _config.NodeColorCondition = new[] { 0.900f, 0.630f, 0.310f };
+            _config.NodeColorLogic     = new[] { 0.950f, 0.840f, 0.350f };
             _config.NodeColorNote      = new[] { 1.000f, 1.000f, 1.000f };
             _config.ComboGroupColor    = new[] { 1.000f, 0.700f, 0.200f };
             _config.BadgeOgcdColor     = new[] { 1.000f, 0.850f, 0.200f };

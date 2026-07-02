@@ -38,6 +38,11 @@ internal static class Style {
             case NodeType.Action:  a = Plugin.Config?.NodeColorAction;  def = new Vector4(0.455f, 0.765f, 1.000f, 1f); break;
             case NodeType.Branch:  a = Plugin.Config?.NodeColorBranch;  def = new Vector4(0.700f, 0.400f, 1.000f, 1f); break;
             case NodeType.Note:    a = Plugin.Config?.NodeColorNote;    def = new Vector4(1f, 1f, 1f, 1f); break;
+            case NodeType.LogicCondition:
+            case NodeType.LatchCondition:
+            case NodeType.KeybindCondition:
+            case NodeType.ToggleCondition:
+                                   a = Plugin.Config?.NodeColorLogic;   def = new Vector4(0.950f, 0.840f, 0.350f, 1f); break;
             default:
                 if (FlowNode.IsGate(t)) { a = Plugin.Config?.NodeColorCondition; def = new Vector4(0.900f, 0.630f, 0.310f, 1f); }
                 else                    { a = null;                              def = new Vector4(1f, 1f, 1f, 1f); }

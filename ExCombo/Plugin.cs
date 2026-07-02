@@ -25,6 +25,8 @@ public sealed class Plugin : IDalamudPlugin {
     [PluginService] internal static IObjectTable            ObjectTable         { get; private set; } = null!;
     [PluginService] internal static ICondition              Condition           { get; private set; } = null!;
     [PluginService] internal static IPartyList              PartyList           { get; private set; } = null!;
+    [PluginService] internal static IKeyState               KeyState            { get; private set; } = null!;
+    [PluginService] internal static IChatGui                ChatGui             { get; private set; } = null!;
 
     // Shared config handle for the static runtime (ActionHook / FlowExecutor / WeaveHelper).
     internal static Configuration Config { get; private set; } = null!;
@@ -40,6 +42,7 @@ public sealed class Plugin : IDalamudPlugin {
     private readonly FlowEditorWindow _editorWindow;
     private readonly ConfigWindow     _configWindow;
     private readonly DebugWindow      _debugWindow;
+    private readonly NodeWikiWindow   _wikiWindow;
     private readonly IDtrBarEntry     _dtrEntry;
     private readonly ActionHook       _actionHook;
 
@@ -51,7 +54,8 @@ public sealed class Plugin : IDalamudPlugin {
         MigrateConfig(_config);
         _actionHook = new ActionHook(_config);
 
-        _editorWindow = new FlowEditorWindow(_config);
+        _wikiWindow   = new NodeWikiWindow();
+        _editorWindow = new FlowEditorWindow(_config, _wikiWindow);
         _debugWindow  = new DebugWindow(_config);
         _configWindow = new ConfigWindow(_config, _debugWindow);
         _mainWindow   = new MainWindow(_config, _editorWindow, _configWindow);
@@ -60,9 +64,11 @@ public sealed class Plugin : IDalamudPlugin {
         _windowSystem.AddWindow(_editorWindow);
         _windowSystem.AddWindow(_configWindow);
         _windowSystem.AddWindow(_debugWindow);
+        _windowSystem.AddWindow(_wikiWindow);
 
         CommandManager.AddHandler(Command, new CommandInfo(OnCommand) {
-            HelpMessage = "Open ExCombo rotation flow editor.",
+            HelpMessage = "Open ExCombo rotation flow editor. \"/excombo wiki\" opens the node reference; "
+                        + "\"/excombo toggle <name>\" flips a Toggle node.",
         });
 
         _dtrEntry         = DtrBar.Get("ExCombo");
@@ -111,7 +117,44 @@ public sealed class Plugin : IDalamudPlugin {
         }
     }
 
-    private void OnCommand(string cmd, string args) => _mainWindow.Toggle();
+    private void OnCommand(string cmd, string args) {
+        var a = args.Trim();
+        if (a.Equals("wiki", System.StringComparison.OrdinalIgnoreCase)) {
+            _wikiWindow.Toggle();
+            return;
+        }
+        if (a.StartsWith("toggle ", System.StringComparison.OrdinalIgnoreCase)) {
+            ToggleByName(a["toggle ".Length..].Trim());
+            return;
+        }
+        _mainWindow.Toggle();
+    }
+
+    // Flip every Toggle node whose name matches, across all flows. Persists and prints feedback.
+    // Echo is client-side only (IChatGui.Print) — never sent to other players.
+    private void ToggleByName(string name) {
+        if (name.Length == 0) { ChatGui.Print("usage: /excombo toggle <name>", "ExCombo"); return; }
+        var hits = 0;
+        bool? newState = null;
+        foreach (var flow in _config.Flows) {
+            var touched = false;
+            foreach (var node in flow.Nodes) {
+                if (node.Type != Flow.NodeType.ToggleCondition) continue;
+                if (!node.ActionLabel.Equals(name, System.StringComparison.OrdinalIgnoreCase)) continue;
+                node.ToggleOn = newState ??= !node.ToggleOn;   // first hit decides; rest sync to it
+                touched = true;
+                hits++;
+            }
+            if (touched) FlowExecutor.InvalidateFlow(flow.Id);
+        }
+        if (hits > 0) {
+            _config.Save();
+            ChatGui.Print($"\"{name}\" → {(newState == true ? "ON" : "OFF")}"
+                        + (hits > 1 ? $" ({hits} nodes)" : ""), "ExCombo");
+        } else {
+            ChatGui.Print($"no Toggle node named \"{name}\" found.", "ExCombo");
+        }
+    }
 
     private void OnFrameworkUpdate(IFramework _) {
         UpdateDtr();
@@ -175,6 +218,7 @@ public sealed class Plugin : IDalamudPlugin {
 
     public void Dispose() {
         _editorWindow.Dispose();
+        _wikiWindow.Dispose();
         _actionHook.Dispose();
         _dtrEntry.Remove();
         Framework.Update                       -= OnFrameworkUpdate;

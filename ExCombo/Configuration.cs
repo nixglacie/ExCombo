@@ -69,6 +69,7 @@ public class Configuration : IPluginConfiguration {
     public float[] NodeColorAction    { get; set; } = { 0.455f, 0.765f, 1.000f };
     public float[] NodeColorBranch    { get; set; } = { 0.700f, 0.400f, 1.000f };
     public float[] NodeColorCondition { get; set; } = { 0.900f, 0.630f, 0.310f };
+    public float[] NodeColorLogic     { get; set; } = { 0.950f, 0.840f, 0.350f };
     public float[] NodeColorNote       { get; set; } = { 1.000f, 1.000f, 1.000f };
     public float[] ComboGroupColor     { get; set; } = { 1.000f, 0.700f, 0.200f };
     public float[] BadgeOgcdColor      { get; set; } = { 1.000f, 0.850f, 0.200f };

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Dalamud.Game.ClientState.Conditions;
+using Dalamud.Game.ClientState.Keys;
 using ExCombo.Flow;
 using ExCombo.Helpers;
 using FFXIVClientStructs.FFXIV.Client.Game;
@@ -285,7 +286,7 @@ internal static class FlowExecutor {
     // ── Inspection (debug overlay / condition inspector) ─────────────────
 
     // Live evaluation of a gate node against current game state. Used by the editor to tint gates.
-    public static bool EvalGate(ComboFlow flow, FlowNode node) => EvaluateCondition(flow.Job, node);
+    public static bool EvalGate(ComboFlow flow, FlowNode node) => EvaluateCondition(flow, node);
 
     // True if a path from a trigger to this node is open under current game state
     // (every gate crossed evaluates live on the port its edge leaves). Used by the editor so an
@@ -301,13 +302,14 @@ internal static class FlowExecutor {
         var any = false;
         foreach (var e in flow.Edges) {
             if (e.ToNodeId != node.Id) continue;
+            if (e.ToPortIndex != 0) continue;                   // predicate wires don't carry flow
             var from = flow.Nodes.Find(n => n.Id == e.FromNodeId);
             if (from == null) continue;
             // Chain predecessor: a later combo step isn't castable until the run advances to it, so an
             // Action→Action edge does not grant reachability — only being the queued step does (above).
             if (from.Type == NodeType.Action) continue;
             if (FlowNode.IsGate(from.Type)) {
-                var pass = EvaluateCondition(flow.Job, from);   // port 0 = true, port 1 = false
+                var pass = EvaluateCondition(flow, from);       // port 0 = true, port 1 = false
                 if (e.FromPortIndex == 0 ? !pass : pass) continue;
             }
             // Branch / Trigger: pass-through (branch port selection is priority/run-state, out of
@@ -378,9 +380,19 @@ internal static class FlowExecutor {
         foreach (var k in _states.Keys)
             if (k.StartsWith(flowId)) toRemove.Add(k);
         foreach (var k in toRemove) _states.Remove(k);
+
+        toRemove.Clear();
+        foreach (var k in _latches.Keys)
+            if (k.StartsWith(flowId)) toRemove.Add(k);
+        foreach (var k in toRemove) _latches.Remove(k);
     }
 
     // ── Graph walker ─────────────────────────────────────────────────────────
+
+    // Forward flow edge from a node's output port. ToPortIndex >= 1 edges are Logic-node predicate
+    // wires and never carry flow, so every traversal lookup must go through this filter.
+    private static FlowEdge? FlowEdgeFrom(ComboFlow f, string nodeId, int port) =>
+        f.Edges.Find(e => e.FromNodeId == nodeId && e.FromPortIndex == port && e.ToPortIndex == 0);
 
     private static void AdvanceState(ComboFlow flow, FlowNode trigger, FlowRunState state) {
         if (state.CurrentBranchId != null) {
@@ -399,7 +411,7 @@ internal static class FlowExecutor {
             bs.SetProgress(port, newIdx < chain.Count ? newIdx : 0);
             ReResolve(flow, state, routeNode);
         } else {
-            var edge = flow.Edges.Find(e => e.FromNodeId == state.NextActionId && e.FromPortIndex == 0);
+            var edge = FlowEdgeFrom(flow, state.NextActionId, 0);
             if (edge == null) { FindInitialAction(flow, trigger, state); return; }
             var next = flow.Nodes.Find(n => n.Id == edge.ToNodeId);
             if      (next == null || next.Type == NodeType.Trigger) FindInitialAction(flow, trigger, state);
@@ -410,7 +422,7 @@ internal static class FlowExecutor {
     }
 
     private static void FindInitialAction(ComboFlow flow, FlowNode trigger, FlowRunState state) {
-        var edge = flow.Edges.Find(e => e.FromNodeId == trigger.Id && e.FromPortIndex == 0);
+        var edge = FlowEdgeFrom(flow, trigger.Id, 0);
         if (edge == null) { state.NextActionId = ""; return; }
         var next = flow.Nodes.Find(n => n.Id == edge.ToNodeId);
         if      (next == null)                  state.NextActionId = "";
@@ -429,7 +441,7 @@ internal static class FlowExecutor {
     // The action chain currently routed through a branch port (resolves nested Condition gates).
     private static List<FlowNode> GetActiveChain(ComboFlow flow, FlowNode routeNode, int port) {
         if (FlowNode.IsGate(routeNode.Type)) return GetPortChain(flow, routeNode.Id, port);
-        var portEdge  = flow.Edges.Find(e => e.FromNodeId == routeNode.Id && e.FromPortIndex == port);
+        var portEdge  = FlowEdgeFrom(flow, routeNode.Id, port);
         var firstNode = portEdge != null ? flow.Nodes.Find(n => n.Id == portEdge.ToNodeId) : null;
         return firstNode != null && FlowNode.IsGate(firstNode.Type)
             ? GetPortChain(flow, firstNode.Id, 0)   // condition gate → its true-port chain
@@ -440,7 +452,7 @@ internal static class FlowExecutor {
     // closed. No usability/weave gating — callers decide that.
     private static (List<FlowNode> chain, int progress, FlowNode cand)? ResolvePort(
             ComboFlow flow, FlowNode branchNode, BranchNodeState bs, int port) {
-        var portEdge  = flow.Edges.Find(e => e.FromNodeId == branchNode.Id && e.FromPortIndex == port);
+        var portEdge  = FlowEdgeFrom(flow, branchNode.Id, port);
         var firstNode = portEdge != null ? flow.Nodes.Find(n => n.Id == portEdge.ToNodeId) : null;
         if (firstNode == null) return null;
 
@@ -450,7 +462,7 @@ internal static class FlowExecutor {
             // Continuation that follows a Burst Strike which just spent the cartridge the gate reads).
             bool midChain = port == bs.ActivePort && bs.GetProgress(port) > 0;
             if (!midChain) {
-                if (!EvaluateCondition(flow.Job, firstNode)) return null;   // gate closed at entry
+                if (!EvaluateCondition(flow, firstNode)) return null;       // gate closed at entry
                 bs.SetProgress(port, 0);                                    // fresh entry → chain head
             }
             chain = GetPortChain(flow, firstNode.Id, 0);
@@ -560,7 +572,7 @@ internal static class FlowExecutor {
 
     private static void EnterCondition(ComboFlow flow, FlowRunState state, FlowNode condNode) {
         state.ActiveBranchNodeId = condNode.Id;
-        bool result = EvaluateCondition(flow.Job, condNode);
+        bool result = EvaluateCondition(flow, condNode);
         int  port   = result ? 0 : 1;
         var  chain  = GetPortChain(flow, condNode.Id, port);
         if (chain.Count == 0) { port ^= 1; chain = GetPortChain(flow, condNode.Id, port); }
@@ -579,10 +591,10 @@ internal static class FlowExecutor {
         state.NextActionId      = chain[progress].Id;
     }
 
-    private static bool EvaluateCondition(string job, FlowNode condNode) {
+    private static bool EvaluateCondition(ComboFlow flow, FlowNode condNode) {
         // Legacy job-gauge gate.
         if (condNode.Type == NodeType.Condition) {
-            var fields = JobGaugeRegistry.GetFields(job);
+            var fields = JobGaugeRegistry.GetFields(flow.Job);
             if (fields == null) return false;
             foreach (var f in fields) {
                 if (f.Name != condNode.ConditionField) continue;
@@ -591,10 +603,23 @@ internal static class FlowExecutor {
             return false;
         }
 
+        // Boolean-expression gate over wired predicate inputs.
+        if (condNode.Type == NodeType.LogicCondition) return EvalLogic(flow, condNode, new HashSet<string>());
+
+        // Held-key gate: true while the chosen key is down (only while the game has focus).
+        if (condNode.Type == NodeType.KeybindCondition)
+            return condNode.CheckParamId != 0 && Plugin.KeyState[(VirtualKey)condNode.CheckParamId];
+
+        // Manual switch: persisted state, flipped in the editor or via "/excombo toggle <name>".
+        if (condNode.Type == NodeType.ToggleCondition) return condNode.ToggleOn;
+
+        // Set/reset memory over two predicate inputs.
+        if (condNode.Type == NodeType.LatchCondition) return EvalLatch(flow, condNode, new HashSet<string>());
+
         // Parameterized condition-family gate (Status/Cooldown/Target/Player/Party/ActionHistory/
         // Gauge). Gauge defs are job-scoped, so resolve them through the job-aware lookup.
         var def = condNode.Type == NodeType.GaugeCondition
-            ? ConditionCatalog.FindGauge(job, condNode.CheckField)
+            ? ConditionCatalog.FindGauge(flow.Job, condNode.CheckField)
             : ConditionCatalog.Find(condNode.Type, condNode.CheckField);
         if (def == null) return false;
         var ctx = new CheckCtx(condNode.CheckParamId, condNode.CheckParam2, condNode.CheckTarget == 1, condNode.CheckSource == 1);
@@ -606,9 +631,70 @@ internal static class FlowExecutor {
         return ((CompareOp)condNode.ConditionCompareOp).Evaluate(value, condNode.ConditionCompareVal);
     }
 
+    // Value carried by a predicate wire leaving a gate's output port: the gate's condition value,
+    // negated when the wire leaves the false port. Only gates (conditions and other Logic nodes)
+    // are valid predicate sources; anything else reads false. Used by Logic inputs and the
+    // editor's wire coloring.
+    public static bool PredicateSignal(ComboFlow flow, FlowNode src, int fromPort) =>
+        PredicateSignal(flow, src, fromPort, new HashSet<string>());
+
+    private static bool PredicateSignal(ComboFlow flow, FlowNode src, int fromPort, HashSet<string> seen) {
+        if (!FlowNode.IsGate(src.Type)) return false;
+        var v = src.Type switch {
+            NodeType.LogicCondition => EvalLogic(flow, src, seen),
+            NodeType.LatchCondition => EvalLatch(flow, src, seen),
+            _                       => EvaluateCondition(flow, src),
+        };
+        return fromPort == 0 ? v : !v;
+    }
+
+    // Logic gate: evaluate the boolean expression over predicate inputs. Input i reads the edge
+    // wired into slot i (ToPortIndex == i) and carries that source port's PredicateSignal.
+    // Unwired inputs, invalid expressions and predicate cycles all fail closed (false).
+    private static bool EvalLogic(ComboFlow flow, FlowNode node, HashSet<string> seen) {
+        if (!seen.Add(node.Id)) return false;                      // cycle guard
+        var ast = LogicExpr.Cached(node.LogicExpr is "" ? "1 AND 2" : node.LogicExpr);
+        if (ast == null || ast.MaxInput > node.LogicInputCount) return false;
+        var result = ast.Eval(i => {
+            var e   = flow.Edges.Find(x => x.ToNodeId == node.Id && x.ToPortIndex == i);
+            var src = e != null ? flow.Nodes.Find(n => n.Id == e.FromNodeId) : null;
+            return src != null && PredicateSignal(flow, src, e!.FromPortIndex, seen);
+        });
+        seen.Remove(node.Id);
+        return result;
+    }
+
+    // ── Latch (set/reset memory) ─────────────────────────────────────────────
+    // Runtime-only state, keyed "{flow.Id}:{node.Id}"; not persisted. Cleared by InvalidateFlow
+    // (any editor commit) or the node's "Reset Latch State" context item.
+    private static readonly Dictionary<string, bool> _latches = new();
+
+    public static bool LatchState(ComboFlow flow, string nodeId) =>
+        _latches.GetValueOrDefault($"{flow.Id}:{nodeId}");
+
+    public static void ResetLatch(ComboFlow flow, string nodeId) =>
+        _latches.Remove($"{flow.Id}:{nodeId}");
+
+    // Slot 1 = SET, slot 2 = RESET; reset wins. The update is idempotent within a frame (signals
+    // are stable across a frame), so evaluating lazily from any caller is safe.
+    private static bool EvalLatch(ComboFlow flow, FlowNode node, HashSet<string> seen) {
+        if (!seen.Add(node.Id)) return LatchState(flow, node.Id);   // cycle guard: read-only
+        bool Signal(int slot) {
+            var e   = flow.Edges.Find(x => x.ToNodeId == node.Id && x.ToPortIndex == slot);
+            var src = e != null ? flow.Nodes.Find(n => n.Id == e.FromNodeId) : null;
+            return src != null && PredicateSignal(flow, src, e!.FromPortIndex, seen);
+        }
+        var key     = $"{flow.Id}:{node.Id}";
+        var latched = _latches.GetValueOrDefault(key);
+        latched = Signal(2) ? false : Signal(1) || latched;
+        _latches[key] = latched;
+        seen.Remove(node.Id);
+        return latched;
+    }
+
     private static List<FlowNode> GetPortChain(ComboFlow flow, string branchNodeId, int portIndex) {
         var chain = new List<FlowNode>();
-        var edge  = flow.Edges.Find(e => e.FromNodeId == branchNodeId && e.FromPortIndex == portIndex);
+        var edge  = FlowEdgeFrom(flow, branchNodeId, portIndex);
         if (edge == null) return chain;
 
         var current = edge.ToNodeId;
@@ -618,7 +704,7 @@ internal static class FlowExecutor {
             var node = flow.Nodes.Find(n => n.Id == current);
             if (node is not { Type: NodeType.Action }) break;
             chain.Add(node);
-            var next = flow.Edges.Find(e => e.FromNodeId == current && e.FromPortIndex == 0);
+            var next = FlowEdgeFrom(flow, current, 0);
             if (next == null) break;
             current = next.ToNodeId;
         }
@@ -682,7 +768,7 @@ internal static class FlowExecutor {
         var current = state.NextActionId;
         var visited = new HashSet<string>();
         while (current != "" && visited.Add(current)) {
-            var edge = flow.Edges.Find(e => e.FromNodeId == current && e.FromPortIndex == 0);
+            var edge = FlowEdgeFrom(flow, current, 0);
             if (edge == null) return 0;
             var next = flow.Nodes.Find(n => n.Id == edge.ToNodeId);
             if (next is not { Type: NodeType.Action }) return 0;
