@@ -17,6 +17,9 @@ internal static class FlowExecutor {
         public string? CommittedBranchId   = null;
         public int     CommittedPort       = -1;
         public readonly Dictionary<string, BranchNodeState> BranchStates = new();
+        // (branchId, port) selected at each level of the last resolution pass, innermost first.
+        public readonly List<(string BranchId, int Port)> ActivePath = new();
+        public string? LastNestedLog       = null;
         public bool    PendingFire         = false;
         public uint    FrozenReturn        = 0;
         public long    LastPressedTick     = 0;
@@ -335,10 +338,15 @@ internal static class FlowExecutor {
         _states.ContainsKey($"{flow.Id}:{triggerId}");
 
     // Currently active output port of the given branch node across the flow's states, or -1.
+    // ActivePath covers every branch level of a nested resolution; CurrentBranchId covers
+    // condition-owned states (EnterCondition doesn't write ActivePath).
     public static int ActiveBranchPort(ComboFlow flow, string branchNodeId) {
-        foreach (var kv in _states)
-            if (kv.Key.StartsWith(flow.Id) && kv.Value.CurrentBranchId == branchNodeId)
-                return kv.Value.CurrentBranchPort;
+        foreach (var kv in _states) {
+            if (!kv.Key.StartsWith(flow.Id)) continue;
+            foreach (var (id, port) in kv.Value.ActivePath)
+                if (id == branchNodeId) return port;
+            if (kv.Value.CurrentBranchId == branchNodeId) return kv.Value.CurrentBranchPort;
+        }
         return -1;
     }
 
@@ -400,6 +408,7 @@ internal static class FlowExecutor {
             if (routeNode == null || !state.BranchStates.TryGetValue(state.CurrentBranchId, out var bs)) {
                 state.CurrentBranchId    = null;
                 state.ActiveBranchNodeId = null;
+                state.ActivePath.Clear();
                 FindInitialAction(flow, trigger, state);
                 return;
             }
@@ -408,8 +417,16 @@ internal static class FlowExecutor {
             var port   = state.CurrentBranchPort;
             var chain  = GetActiveChain(flow, routeNode, port);
             var newIdx = bs.GetProgress(port) + 1;
-            bs.SetProgress(port, newIdx < chain.Count ? newIdx : 0);
-            ReResolve(flow, state, routeNode);
+            // Chain end flowing into a trailing Branch → park past the end (progress == count);
+            // resolution then routes through the trailing branch instead of wrapping to the head.
+            if (newIdx >= chain.Count && ChainTrailingBranch(flow, chain) != null)
+                bs.SetProgress(port, chain.Count);
+            else
+                bs.SetProgress(port, newIdx < chain.Count ? newIdx : 0);
+            // Re-resolve from the outermost entry node so higher-priority OUTER ports can preempt;
+            // the (possibly nested) inner branch keeps its port progress and resumes if selected.
+            var top = state.ActiveBranchNodeId != null ? flow.Nodes.Find(n => n.Id == state.ActiveBranchNodeId) : null;
+            ReResolve(flow, state, top ?? routeNode);
         } else {
             var edge = FlowEdgeFrom(flow, state.NextActionId, 0);
             if (edge == null) { FindInitialAction(flow, trigger, state); return; }
@@ -422,6 +439,7 @@ internal static class FlowExecutor {
     }
 
     private static void FindInitialAction(ComboFlow flow, FlowNode trigger, FlowRunState state) {
+        state.ActivePath.Clear();   // rebuilt below when routing lands in a branch
         var edge = FlowEdgeFrom(flow, trigger.Id, 0);
         if (edge == null) { state.NextActionId = ""; return; }
         var next = flow.Nodes.Find(n => n.Id == edge.ToNodeId);
@@ -472,7 +490,13 @@ internal static class FlowExecutor {
         if (chain.Count == 0) return null;
 
         var progress = bs.GetProgress(port);
-        if (progress >= chain.Count) { bs.SetProgress(port, 0); progress = 0; }
+        if (progress >= chain.Count) {
+            // Parked past the chain end inside a trailing Branch: surface the branch as the
+            // candidate — the caller recurses into it. Otherwise wrap to the chain head as before.
+            if (progress == chain.Count && ChainTrailingBranch(flow, chain) is { } trail)
+                return (chain, progress, trail);
+            bs.SetProgress(port, 0); progress = 0;
+        }
         return (chain, progress, chain[progress]);
     }
 
@@ -481,6 +505,32 @@ internal static class FlowExecutor {
     // strictly-higher oGCD port may weave in) until it completes.
     private static void ResolveBranch(ComboFlow flow, FlowRunState state, FlowNode branchNode) {
         state.ActiveBranchNodeId = branchNode.Id;
+        state.ActivePath.Clear();
+        // Commit pointing at a node deleted in the editor → clear before resolving.
+        if (state.CommittedBranchId != null && flow.Nodes.Find(n => n.Id == state.CommittedBranchId) == null) {
+            state.CommittedBranchId = null;
+            state.CommittedPort     = -1;
+        }
+        if (!TryResolveBranch(flow, state, branchNode, new HashSet<string>())) {
+            // Nothing eligible this frame — fall back to the raw trigger; keep re-evaluating.
+            state.CurrentBranchId = null;
+            state.NextActionId    = "";
+        }
+    }
+
+    // Recursive worker: a port routing into another Branch (directly or across one passed gate)
+    // resolves that branch as a nested level — CurrentBranchId ends up at the INNERMOST branch
+    // owning the surfaced chain, while ActiveBranchNodeId stays the outermost entry so per-frame
+    // re-evaluation preserves outer-priority preemption. Returns false without touching run state
+    // so the caller falls through to its next port. `seen` breaks Branch→Branch cycles and resolves
+    // a diamond-shared inner branch once per pass.
+    //
+    // Group commitment is per-level: CommittedBranchId is the chain-owning (inner) branch, and a
+    // higher-priority OUTER port may still preempt it — the group's progress persists and resumes
+    // when the branch is selected again. Nested oGCD-led inner ports don't weave into an outer
+    // committed hold (CommitActive/ResolvePort see nested ports as null).
+    private static bool TryResolveBranch(ComboFlow flow, FlowRunState state, FlowNode branchNode, HashSet<string> seen) {
+        if (!seen.Add(branchNode.Id)) return false;   // cycle / already resolved this pass
 
         if (!state.BranchStates.TryGetValue(branchNode.Id, out var bs)) {
             bs = new BranchNodeState();
@@ -513,19 +563,47 @@ internal static class FlowExecutor {
                 state.CurrentBranchId   = branchNode.Id;
                 state.CurrentBranchPort = p;
                 state.NextActionId      = w.cand.Id;
-                return;
+                state.ActivePath.Add((branchNode.Id, p));
+                return true;
             }
             var g = ResolvePort(flow, branchNode, bs, state.CommittedPort)!.Value;
             bs.ActivePort           = state.CommittedPort;
             state.CurrentBranchId   = branchNode.Id;
             state.CurrentBranchPort = state.CommittedPort;
             state.NextActionId      = g.cand.Id;
-            return;
+            state.ActivePath.Add((branchNode.Id, state.CommittedPort));
+            return true;
         }
 
         for (var port = 0; port < branchNode.OutputCount; port++) {
+            // Port routes into another Branch → recurse; the inner branch owns the surfaced chain.
+            if (PortNestedBranch(flow, branchNode, port) is { } nested) {
+                if (TryResolveBranch(flow, state, nested, seen)) {
+                    bs.ActivePort = port;
+                    state.ActivePath.Add((branchNode.Id, port));
+                    NestedLog(state, $"[ExCombo][Branch] nested {branchNode.Id}:{port} → {nested.Id} surfaced {state.NextActionId}");
+                    return true;
+                }
+                NestedLog(state, $"[ExCombo][Branch] nested {branchNode.Id}:{port} → {nested.Id} no eligible port, next port");
+                continue;   // inner branch nothing eligible this frame — try the next port
+            }
+
             var r = ResolvePort(flow, branchNode, bs, port);
             if (r is not { } rr) continue;
+
+            // Chain end parked in a trailing Branch → recurse; the inner branch owns from here on
+            // (until the run resets — priority nodes never "complete", so there is no way back to
+            // the chain head short of a reset or a gated re-entry after preemption).
+            if (rr.cand.Type == NodeType.Branch) {
+                if (TryResolveBranch(flow, state, rr.cand, seen)) {
+                    bs.ActivePort = port;
+                    state.ActivePath.Add((branchNode.Id, port));
+                    NestedLog(state, $"[ExCombo][Branch] trailing {branchNode.Id}:{port} → {rr.cand.Id} surfaced {state.NextActionId}");
+                    return true;
+                }
+                NestedLog(state, $"[ExCombo][Branch] trailing {branchNode.Id}:{port} → {rr.cand.Id} no eligible port, next port");
+                continue;
+            }
 
             // oGCD ports are eligible only inside the weave window and when actually usable.
             if (ActionHelper.IsOgcd(rr.cand.ActionId)) {
@@ -550,7 +628,8 @@ internal static class FlowExecutor {
                             state.CurrentBranchId   = branchNode.Id;
                             state.CurrentBranchPort = port;
                             state.NextActionId      = rr.chain[i].Id;
-                            return;
+                            state.ActivePath.Add((branchNode.Id, port));
+                            return true;
                         }
                     }
                     continue;   // fresh oGCD-led port not ready, or no GCD left in chain → lower priority
@@ -562,20 +641,63 @@ internal static class FlowExecutor {
             state.CurrentBranchId   = branchNode.Id;
             state.CurrentBranchPort = port;
             state.NextActionId      = rr.cand.Id;
-            return;
+            state.ActivePath.Add((branchNode.Id, port));
+            return true;
         }
 
-        // Nothing eligible this frame — fall back to the raw trigger; keep re-evaluating.
-        state.CurrentBranchId = null;
-        state.NextActionId    = "";
+        return false;
     }
+
+    // Nested-resolution debug lines fire every frame via ReResolve — only log on change.
+    private static void NestedLog(FlowRunState state, string msg) {
+        if (state.LastNestedLog == msg) return;
+        state.LastNestedLog = msg;
+        Plugin.LogDebug(msg);
+    }
+
+    // The inner Branch a branch port routes into — directly, or across ONE passed condition gate's
+    // true port. Null when the port heads a plain action chain, is disconnected, or the gate is
+    // closed (a closed gate then falls through to ResolvePort, which also rejects it). A Branch
+    // after action nodes is handled separately as a trailing branch (see ChainTrailingBranch).
+    private static FlowNode? PortNestedBranch(ComboFlow flow, FlowNode branchNode, int port) {
+        var edge = FlowEdgeFrom(flow, branchNode.Id, port);
+        var node = edge != null ? flow.Nodes.Find(n => n.Id == edge.ToNodeId) : null;
+        if (node == null) return null;
+        if (node.Type == NodeType.Branch) return node;
+        if (!FlowNode.IsGate(node.Type) || !EvaluateCondition(flow, node)) return null;
+        return PortTargetBranch(flow, node.Id, 0);
+    }
+
+    // The Branch node a port's flow edge points at directly, or null.
+    private static FlowNode? PortTargetBranch(ComboFlow flow, string nodeId, int port) {
+        var edge = FlowEdgeFrom(flow, nodeId, port);
+        var tgt  = edge != null ? flow.Nodes.Find(n => n.Id == edge.ToNodeId) : null;
+        return tgt is { Type: NodeType.Branch } ? tgt : null;
+    }
+
+    // The Branch node the chain's LAST action flows into, or null. A chain that continues into a
+    // priority node hands control to it once its last action has fired (progress parks at
+    // chain.Count instead of wrapping to the head).
+    private static FlowNode? ChainTrailingBranch(ComboFlow flow, List<FlowNode> chain) =>
+        chain.Count == 0 ? null : PortTargetBranch(flow, chain[^1].Id, 0);
 
     private static void EnterCondition(ComboFlow flow, FlowRunState state, FlowNode condNode) {
         state.ActiveBranchNodeId = condNode.Id;
+        state.ActivePath.Clear();
         bool result = EvaluateCondition(flow, condNode);
         int  port   = result ? 0 : 1;
-        var  chain  = GetPortChain(flow, condNode.Id, port);
-        if (chain.Count == 0) { port ^= 1; chain = GetPortChain(flow, condNode.Id, port); }
+
+        // A gate port routing into a Branch resolves that branch as a nested level beneath the gate
+        // (the gate stays the outermost re-entry node, so it re-evaluates every frame). The gate
+        // already decided the route — an empty inner branch surfaces nothing rather than falling
+        // back to the gate's other port.
+        var chain = GetPortChain(flow, condNode.Id, port);
+        if (chain.Count == 0) {
+            if (PortTargetBranch(flow, condNode.Id, port) is { } b) { RouteConditionBranch(flow, state, b); return; }
+            port ^= 1;
+            chain = GetPortChain(flow, condNode.Id, port);
+            if (chain.Count == 0 && PortTargetBranch(flow, condNode.Id, port) is { } b2) { RouteConditionBranch(flow, state, b2); return; }
+        }
         if (chain.Count == 0) { state.NextActionId = ""; return; }
 
         if (!state.BranchStates.TryGetValue(condNode.Id, out var bs)) {
@@ -584,11 +706,25 @@ internal static class FlowExecutor {
         }
         if (bs.ActivePort >= 0 && bs.ActivePort != port) bs.SetProgress(bs.ActivePort, 0);
         var progress = bs.GetProgress(port);
-        if (progress >= chain.Count) { bs.SetProgress(port, 0); progress = 0; }
+        if (progress >= chain.Count) {
+            // Parked past the chain end inside a trailing Branch → route through it.
+            if (progress == chain.Count && ChainTrailingBranch(flow, chain) is { } tb) {
+                RouteConditionBranch(flow, state, tb);
+                return;
+            }
+            bs.SetProgress(port, 0); progress = 0;
+        }
         bs.ActivePort           = port;
         state.CurrentBranchId   = condNode.Id;
         state.CurrentBranchPort = port;
         state.NextActionId      = chain[progress].Id;
+    }
+
+    private static void RouteConditionBranch(ComboFlow flow, FlowRunState state, FlowNode branchNode) {
+        if (!TryResolveBranch(flow, state, branchNode, new HashSet<string>())) {
+            state.CurrentBranchId = null;
+            state.NextActionId    = "";   // nothing eligible this frame; re-evaluated next frame
+        }
     }
 
     private static bool EvaluateCondition(ComboFlow flow, FlowNode condNode) {
@@ -732,7 +868,8 @@ internal static class FlowExecutor {
                     while (resetTo > 0 && chain[resetTo - 1].GroupId == gid) resetTo--;
                 }
                 bs.SetProgress(state.CurrentBranchPort, resetTo);
-                ReResolve(flow, state, node);
+                var top = state.ActiveBranchNodeId != null ? flow.Nodes.Find(n => n.Id == state.ActiveBranchNodeId) : null;
+                ReResolve(flow, state, top ?? node);
                 return;
             }
         }
@@ -832,6 +969,8 @@ internal static class FlowExecutor {
         s.WeavedThisWindow   = 0;
         s.LastGCDElapsed     = 0f;
         s.LastTickSkipId     = null;
+        s.LastNestedLog      = null;
+        s.ActivePath.Clear();
         foreach (var bs in s.BranchStates.Values) {
             bs.ActivePort = -1;
             bs.PortProgress.Clear();
