@@ -1,10 +1,13 @@
 using System;
+using System.IO;
 using System.Numerics;
 using System.Reflection;
 using System.Text.Json;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
+using Dalamud.Interface.Components;
 using Dalamud.Interface.Windowing;
+using Dalamud.Utility;
 
 namespace ExCombo.Windows;
 
@@ -86,6 +89,24 @@ public class ConfigWindow : Window {
         if (ImGui.Checkbox("Show \"EX\" in server info bar", ref dtr)) { _config.ShowDtrEntry = dtr; _config.Save(); }
         Help("Show a clickable EX button in the server info bar that opens the flow list.");
 
+        ImGui.Indent(22f);
+        ImGui.BeginDisabled(!_config.ShowDtrEntry);
+
+        bool dtrState = _config.DtrShowState;
+        if (ImGui.Checkbox("Show global on/off state", ref dtrState)) { _config.DtrShowState = dtrState; _config.Save(); }
+        Help("Show a red \"Off\" next to EX while the master switch is disabled. Nothing extra while on.");
+
+        bool dtrFlow = _config.DtrShowActiveFlow;
+        if (ImGui.Checkbox("Show active flow for current job", ref dtrFlow)) { _config.DtrShowActiveFlow = dtrFlow; _config.Save(); }
+        Help("Append the enabled flow name for your current job (\"+N\" if several are enabled). Hidden while the master switch is off.");
+
+        ImGui.EndDisabled();
+        ImGui.Unindent(22f);
+
+        bool kofi = _config.ShowKofiButton;
+        if (ImGui.Checkbox("Show Ko-fi button in main window", ref kofi)) { _config.ShowKofiButton = kofi; _config.Save(); }
+        Help("Show the Ko-fi support button in the flow list toolbar. The About tab always has the link.");
+
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
@@ -111,7 +132,11 @@ public class ConfigWindow : Window {
         ImGui.Spacing();
 
         if (ImGui.Button("Export all flows")) {
-            try { ImGui.SetClipboardText(JsonSerializer.Serialize(_config.Flows)); _dataMsg = "Copied all flows to clipboard."; }
+            try {
+                _dataMsg = Helpers.ClipboardHelper.SetText(JsonSerializer.Serialize(_config.Flows))
+                    ? "Copied all flows to clipboard."
+                    : "Export failed: clipboard unavailable.";
+            }
             catch { _dataMsg = "Export failed."; }
         }
         Help("Copy every flow to the clipboard as a JSON backup. Import individual flows from the main window.");
@@ -130,6 +155,9 @@ public class ConfigWindow : Window {
     private void ResetAllSettings() {
         _config.Enabled            = true;
         _config.ShowDtrEntry       = true;
+        _config.ShowKofiButton     = true;
+        _config.DtrShowState       = false;
+        _config.DtrShowActiveFlow  = false;
         _config.MaxWeavesPerGcd    = 2;
         _config.AnimLockBudget     = 0.6f;
         _config.QueueBudget        = 0.5f;
@@ -346,15 +374,101 @@ public class ConfigWindow : Window {
     // ── About ────────────────────────────────────────────────────────────
     private void DrawAbout() {
         ImGui.Spacing();
+        const float avSize = 80f;
+        var avTop = ImGui.GetCursorPos();
+        DrawAvatar(avSize);
+
+        // Text block on its own lines (not SameLine with the avatar) so baselines stay consistent.
+        var buttonH = ImGui.GetTextLineHeight() + 12f; // frame padding 6 top/bottom
+        var blockH  = ImGui.GetTextLineHeightWithSpacing() * 2f + buttonH;
+        ImGui.SetCursorPos(new Vector2(avTop.X + avSize + 12f, avTop.Y + (avSize - blockH) * 0.5f));
+        ImGui.BeginGroup();
         ImGui.Text("ExCombo");
-        ImGui.SameLine();
+        ImGui.SameLine(0, 6f);
         ImGui.TextDisabled($"v{Version}");
+        ImGui.Text("by");
+        ImGui.SameLine(0, 5f);
+        ImGui.TextColored(Style.AccentColor, "Exora");
+
+        DrawKofiButton();
+        ImGui.EndGroup();
+
+        var afterY = Math.Max(avTop.Y + avSize, ImGui.GetCursorPosY());
+        ImGui.SetCursorPos(new Vector2(avTop.X, afterY));
         ImGui.Spacing();
         ImGui.TextWrapped("Node-based combat rotation editor. Use /excombo to open the flow list.");
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
+        ImGui.TextDisabled("Why this exists");
+        ImGui.TextWrapped(
+            "ExCombo was born from a support conversation that went nowhere. I noticed odd oGCD " +
+            "timing and gaps in an auto-rotation plugin and asked whether the oGCD window could be " +
+            "made adjustable. The answer was, in short: the plugin knows better than you, the setting " +
+            "won't be exposed because users can't be trusted with it, and my options were to press the " +
+            "buttons myself, fork it and build the whole thing on my own, or accept it and stop asking.\n\n" +
+            "So I picked option two. ExCombo is the opposite philosophy: every timing, every priority, " +
+            "every decision in your rotation is yours to see and yours to change. No black box, no " +
+            "\"trust me\" — if you want to tweak it, the knob is there.");
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
         ImGui.TextDisabled("License: AGPL-3.0-or-later");
+    }
+
+    // Ko-fi button: white coffee icon, dark bold label. Drawn manually because
+    // IconButtonWithText colors icon and text together, and ImGui has no bold font
+    // (bold is faked with a second offset draw).
+    private static void DrawKofiButton() {
+        const string label = "Support ExCombo";
+        const float  gap   = 6f;
+        var pad = new Vector2(14f, 6f);
+
+        var iconStr = FontAwesomeIcon.Coffee.ToIconString();
+        ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
+        var iconSz = ImGui.CalcTextSize(iconStr);
+        ImGui.PopFont();
+        var textSz = ImGui.CalcTextSize(label);
+
+        var btnSz  = new Vector2(pad.X * 2f + iconSz.X + gap + textSz.X + 1f,
+                                 pad.Y * 2f + MathF.Max(iconSz.Y, textSz.Y));
+        var btnPos = ImGui.GetCursorScreenPos();
+
+        ImGui.PushStyleColor(ImGuiCol.Button,        MainWindow.KofiRed);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(1f, 0.47f, 0.46f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive,  new Vector4(0.87f, 0.30f, 0.29f, 1f));
+        if (ImGui.Button("##kofi", btnSz)) Util.OpenLink(MainWindow.KofiUrl);
+        ImGui.PopStyleColor(3);
+
+        var dl = ImGui.GetWindowDrawList();
+
+        ImGui.PushFont(Plugin.PluginInterface.UiBuilder.FontIcon);
+        dl.AddText(new Vector2(btnPos.X + pad.X, btnPos.Y + (btnSz.Y - iconSz.Y) * 0.5f),
+                   0xFFFFFFFFu, iconStr);
+        ImGui.PopFont();
+
+        // Super-bold fake: stack offset passes around the baseline draw.
+        var tp = new Vector2(btnPos.X + pad.X + iconSz.X + gap, btnPos.Y + (btnSz.Y - textSz.Y) * 0.5f);
+        dl.AddText(tp,                          0xFFFFFFFFu, label);
+        dl.AddText(tp + new Vector2(0.6f, 0f),  0xFFFFFFFFu, label);
+        dl.AddText(tp + new Vector2(1.2f, 0f),  0xFFFFFFFFu, label);
+        dl.AddText(tp + new Vector2(0.6f, 0.5f), 0xFFFFFFFFu, label);
+    }
+
+    // Rounded-corner author avatar with an accent border; silently skips if the file is missing.
+    private static void DrawAvatar(float size) {
+        var path = Path.Combine(Plugin.PluginInterface.AssemblyLocation.DirectoryName ?? "", "avatar-exora.png");
+        var tex  = Plugin.TextureProvider.GetFromFile(path).GetWrapOrDefault();
+        if (tex == null) return;
+
+        const float rounding = 12f;
+        var pos = ImGui.GetCursorScreenPos();
+        var dl  = ImGui.GetWindowDrawList();
+        dl.AddImageRounded(tex.Handle, pos, pos + new Vector2(size, size),
+                           Vector2.Zero, Vector2.One, 0xFFFFFFFFu, rounding);
+        dl.AddRect(pos, pos + new Vector2(size, size),
+                   ImGui.GetColorU32(Style.AccentColor), rounding, ImDrawFlags.None, 2f);
+        ImGui.Dummy(new Vector2(size, size));
     }
 
     // Small "(?)" hover marker with an explanatory tooltip.

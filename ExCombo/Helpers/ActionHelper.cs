@@ -16,4 +16,11 @@ internal static class ActionHelper {
         _ogcdCache[actionId] = v;
         return v;
     }
+
+    // ActionCategory row id: 2 = Spell, 3 = Weaponskill, 4 = Ability (oGCD). 0 if unknown.
+    public static uint Category(uint actionId) {
+        if (actionId == 0) return 0;
+        var row = Plugin.DataManager.GetExcelSheet<LuminaAction>()?.GetRow(actionId);
+        return row.HasValue ? row.Value.ActionCategory.RowId : 0;
+    }
 }

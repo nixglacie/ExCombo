@@ -1,5 +1,7 @@
+using System.Linq;
 using Dalamud.Game.Command;
 using Dalamud.Game.Gui.Dtr;
+using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Interface.Windowing;
 using Dalamud.IoC;
 using Dalamud.Plugin;
@@ -46,6 +48,7 @@ public sealed class Plugin : IDalamudPlugin {
     public Plugin() {
         _config     = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         Config      = _config;
+        MigrateConfig(_config);
         _actionHook = new ActionHook(_config);
 
         _editorWindow = new FlowEditorWindow(_config);
@@ -64,9 +67,17 @@ public sealed class Plugin : IDalamudPlugin {
 
         _dtrEntry         = DtrBar.Get("ExCombo");
         _dtrEntry.Text    = "EX";
-        _dtrEntry.Tooltip = new Dalamud.Game.Text.SeStringHandling.SeString(
-            new Dalamud.Game.Text.SeStringHandling.Payloads.TextPayload("ExCombo"));
-        _dtrEntry.OnClick = _ => _mainWindow.Toggle();
+        _dtrEntry.Tooltip = new SeString(
+            new Dalamud.Game.Text.SeStringHandling.Payloads.TextPayload(
+                "ExCombo\nLeft click: toggle on/off\nRight click: open flow list"));
+        _dtrEntry.OnClick = e => {
+            if (e.ClickType == MouseClickType.Right) {
+                _mainWindow.Toggle();
+            } else {
+                _config.Enabled = !_config.Enabled;
+                _config.Save();
+            }
+        };
         _dtrEntry.Shown   = _config.ShowDtrEntry;
 
         PluginInterface.UiBuilder.Draw         += _windowSystem.Draw;
@@ -75,12 +86,92 @@ public sealed class Plugin : IDalamudPlugin {
         Framework.Update                        += OnFrameworkUpdate;
     }
 
+    // One-time config migrations, keyed off Configuration.Version.
+    private static void MigrateConfig(Configuration cfg) {
+        if (cfg.Version < 2) {
+            // Legacy job-gauge gate (NodeType.Condition) → unified GaugeCondition family. The gauge
+            // field name moves ConditionField → CheckField; compare op/value are already shared.
+            foreach (var flow in cfg.Flows)
+                foreach (var node in flow.Nodes)
+                    if (node.Type == Flow.NodeType.Condition) {
+                        node.Type       = Flow.NodeType.GaugeCondition;
+                        node.CheckField = node.ConditionField;
+                    }
+            cfg.Version = 2;
+            cfg.Save();
+        }
+        if (cfg.Version < 3) {
+            // PlayerHasAggro moved from the Party family to Player (it's the player's own threat).
+            foreach (var flow in cfg.Flows)
+                foreach (var node in flow.Nodes)
+                    if (node.Type == Flow.NodeType.PartyCondition && node.CheckField == "PlayerHasAggro")
+                        node.Type = Flow.NodeType.PlayerCondition;
+            cfg.Version = 3;
+            cfg.Save();
+        }
+    }
+
     private void OnCommand(string cmd, string args) => _mainWindow.Toggle();
 
     private void OnFrameworkUpdate(IFramework _) {
-        _dtrEntry.Shown = _config.ShowDtrEntry;
+        UpdateDtr();
         FlowExecutor.Tick(_config.Flows);
     }
+
+    private string? _dtrLastKey;
+
+    // Server-bar text: "EX", optionally with master On/Off state and/or job icon +
+    // active flow name for the player's current job. Rebuilt each tick, assigned only on change.
+    private void UpdateDtr() {
+        _dtrEntry.Shown = _config.ShowDtrEntry;
+        if (!_config.ShowDtrEntry) return;
+
+        bool showOff = _config.DtrShowState && !_config.Enabled;
+
+        var  flowText = "";
+        uint jobRow   = 0;
+        if (_config.DtrShowActiveFlow && _config.Enabled) {
+            var player = ObjectTable.LocalPlayer;
+            var job    = player?.ClassJob.ValueNullable?.Abbreviation.ToString();
+            if (!string.IsNullOrEmpty(job)) {
+                var names = _config.Flows.Where(f => f.Enabled && f.Job == job)
+                                         .Select(f => f.Name).ToList();
+                if (names.Count > 0) {
+                    jobRow   = player!.ClassJob.RowId;
+                    flowText = names[0] + (names.Count > 1 ? $" +{names.Count - 1}" : "");
+                }
+            }
+        }
+
+        var key = $"{showOff}|{jobRow}|{flowText}";
+        if (key == _dtrLastKey) return;
+        _dtrLastKey = key;
+
+        if (showOff) {
+            _dtrEntry.Text = new SeStringBuilder().AddText("EX: ")
+                .AddUiForeground("Off", 539).Build();   // UIColor 539 = red
+            return;
+        }
+
+        if (flowText.Length == 0) {
+            _dtrEntry.Text = "EX";
+            return;
+        }
+
+        var sb = new SeStringBuilder().AddText("EX: ");
+        var icon = JobBitmapIcon(jobRow);
+        if (icon != BitmapFontIcon.None) sb.AddIcon(icon);
+        sb.AddText(flowText);
+        _dtrEntry.Text = sb.Build();
+    }
+
+    // ClassJob row → BitmapFontIcon: rows 1–40 are contiguous at 127+row; VPR/PCT skip ahead.
+    private static BitmapFontIcon JobBitmapIcon(uint rowId) => rowId switch {
+        >= 1 and <= 40 => (BitmapFontIcon)(127 + rowId),
+        41             => BitmapFontIcon.Viper,
+        42             => BitmapFontIcon.Pictomancer,
+        _              => BitmapFontIcon.None,
+    };
 
     public void Dispose() {
         _editorWindow.Dispose();

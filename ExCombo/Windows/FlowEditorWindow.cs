@@ -74,6 +74,7 @@ public class FlowEditorWindow : Window {
     private string   _condParamLabel  = "";
     private float    _condParam2;
     private int      _condTarget;
+    private int      _condSource;
     private string   _condParamSearch = "";
     private readonly List<(uint Id, string Name, uint Icon, byte Level)> _condParamResults = new();
     private string   _condParamLastSearch = "\0";
@@ -1063,9 +1064,9 @@ public class FlowEditorWindow : Window {
                         : Style.NodeColU32(node.Type, 0.5f);
                 dl.AddRectFilled(sp, sp + new Vector2(NodeSize.X, nodeH), Col(0.12f, 0.08f, 0.03f), 6f);
 
-                // Body icon: legacy job gauge = job icon; Status/Cooldown = picked status/action icon;
-                // Target/Player/Party = a category glyph.
-                if (isJobCond) {
+                // Body icon: job gauge (legacy + GaugeCondition) = job icon; Status/Cooldown = picked
+                // status/action icon; Target/Player/Party/Action = a category glyph.
+                if (isJobCond || node.Type == NodeType.GaugeCondition) {
                     var jobIconId = GetJobIconId(_flow!.Job);
                     if (jobIconId != 0) {
                         var tex = Plugin.TextureProvider
@@ -1085,10 +1086,11 @@ public class FlowEditorWindow : Window {
                         var ioff  = new Vector2((NodeSize.X - isz.X) * 0.5f, (nodeH - isz.Y) * 0.5f + iyAdj);
                         DrawHelpers.DrawIcon(dl, tex, sp + ioff, isz, 1f, 6f);
                     }
-                } else if (node.Type is NodeType.TargetCondition or NodeType.PlayerCondition or NodeType.PartyCondition) {
+                } else if (node.Type is NodeType.TargetCondition or NodeType.PlayerCondition or NodeType.PartyCondition or NodeType.ActionHistoryCondition) {
                     var glyph = node.Type switch {
                         NodeType.TargetCondition => FontAwesomeIcon.Crosshairs,
                         NodeType.PlayerCondition => FontAwesomeIcon.User,
+                        NodeType.ActionHistoryCondition => FontAwesomeIcon.History,
                         _                        => FontAwesomeIcon.Users,
                     };
                     var gstr = glyph.ToIconString();
@@ -1436,12 +1438,13 @@ public class FlowEditorWindow : Window {
             if (IconMenuItem(FontAwesomeIcon.CodeBranch,  "Add Priority",  Style.NodeColU32(NodeType.Branch))) AddNode(NodeType.Branch);
             var condCol = Style.NodeColU32(NodeType.StatusCondition);
             if (IconBeginMenu(FontAwesomeIcon.Filter, "Add Condition", condCol)) {
-                if (IconMenuItem(FontAwesomeIcon.Filter,    "Job Gauge",  condCol)) AddGateNode(NodeType.Condition);
+                if (IconMenuItem(FontAwesomeIcon.ChartBar,  "Gauge",      condCol)) AddGateNode(NodeType.GaugeCondition);
                 if (IconMenuItem(FontAwesomeIcon.Magic,     "Status",     condCol)) AddGateNode(NodeType.StatusCondition);
                 if (IconMenuItem(FontAwesomeIcon.Hourglass, "Cooldown",   condCol)) AddGateNode(NodeType.CooldownCondition);
                 if (IconMenuItem(FontAwesomeIcon.Crosshairs,"Target",     condCol)) AddGateNode(NodeType.TargetCondition);
                 if (IconMenuItem(FontAwesomeIcon.User,      "Player",     condCol)) AddGateNode(NodeType.PlayerCondition);
                 if (IconMenuItem(FontAwesomeIcon.Users,     "Party",      condCol)) AddGateNode(NodeType.PartyCondition);
+                if (IconMenuItem(FontAwesomeIcon.History,   "Action History", condCol)) AddGateNode(NodeType.ActionHistoryCondition);
                 ImGui.EndMenu();
             }
             if (IconMenuItem(FontAwesomeIcon.StickyNote,  "Add Note",      Style.NodeColU32(NodeType.Note))) AddNoteNode();
@@ -1555,6 +1558,8 @@ public class FlowEditorWindow : Window {
         NodeType.TargetCondition   => "Target",
         NodeType.PlayerCondition   => "Player",
         NodeType.PartyCondition    => "Party",
+        NodeType.ActionHistoryCondition => "Action",
+        NodeType.GaugeCondition    => "Gauge",
         _ => "Condition",
     };
 
@@ -1562,6 +1567,8 @@ public class FlowEditorWindow : Window {
         var op  = ((CompareOp)n.ConditionCompareOp).ToLabel();
         if (n.Type == NodeType.Condition)
             return n.ConditionField != "" ? $"{n.ConditionField} {op} {n.ConditionCompareVal}" : "Job Condition";
+        if (n.Type == NodeType.GaugeCondition)
+            return n.CheckField != "" ? $"{n.CheckField} {op} {n.ConditionCompareVal:0.##}" : "Gauge";
         var def = ConditionCatalog.Find(n.Type, n.CheckField);
         if (def == null) return GateCategory(n.Type);
         if (def.Bool) return n.ConditionCompareVal >= 1f ? def.Label : $"!{def.Label}";
@@ -1991,6 +1998,7 @@ public class FlowEditorWindow : Window {
             _condParamIcon       = node?.IconId ?? 0;
             _condParam2          = node?.CheckParam2 ?? 0f;
             _condTarget          = node?.CheckTarget ?? 0;
+            _condSource          = node?.CheckSource ?? 0;
             _condParamSearch     = "";
             _condParamLastSearch = "\0";
             _condParamLastKind   = CheckParamKind.None;
@@ -2049,7 +2057,9 @@ public class FlowEditorWindow : Window {
     }
 
     private void DrawParamConditionBody() {
-        var defs = ConditionCatalog.For(_condEditType);
+        var defs = _condEditType == NodeType.GaugeCondition
+            ? ConditionCatalog.ForGauge(_flow?.Job ?? "")
+            : ConditionCatalog.For(_condEditType);
 
         ImGui.TextDisabled("Check");
         ImGui.SetNextItemWidth(CondW);
@@ -2065,7 +2075,9 @@ public class FlowEditorWindow : Window {
             }
         ImGui.EndChild();
 
-        var def = ConditionCatalog.Find(_condEditType, _condFieldSelected);
+        var def = _condEditType == NodeType.GaugeCondition
+            ? ConditionCatalog.FindGauge(_flow?.Job ?? "", _condFieldSelected)
+            : ConditionCatalog.Find(_condEditType, _condFieldSelected);
         ImGui.Spacing();
 
         if (def != null) {
@@ -2120,6 +2132,14 @@ public class FlowEditorWindow : Window {
                 ImGui.RadioButton("Target##ct", ref _condTarget, 1);
             }
 
+            // Status source scope toggle (applied by me vs any owner).
+            if (def.HasSource) {
+                ImGui.Spacing();
+                ImGui.TextDisabled("Source");
+                ImGui.RadioButton("Me##cs", ref _condSource, 0); ImGui.SameLine();
+                ImGui.RadioButton("Anyone##cs", ref _condSource, 1);
+            }
+
             // Comparison.
             ImGui.Spacing();
             if (def.Bool) {
@@ -2150,6 +2170,7 @@ public class FlowEditorWindow : Window {
             node.CheckParamId        = _condParamId;
             node.CheckParam2         = _condParam2;
             node.CheckTarget         = _condTarget;
+            node.CheckSource         = _condSource;
             node.ConditionCompareOp  = _condEditOp;
             node.ConditionCompareVal = _condEditValF;
             node.IconId              = iconParam ? _condParamIcon : 0;  // status/action icon for the node body

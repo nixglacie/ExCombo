@@ -14,6 +14,8 @@ public enum NodeType {
     TargetCondition  = 7,
     PlayerCondition  = 8,
     PartyCondition   = 9,
+    ActionHistoryCondition = 10,   // gate on the player's own recent casts (ActionTracker)
+    GaugeCondition         = 11,   // gate on a job-gauge field (supersedes the legacy Condition node)
 }
 
 // Built-in target resolvers for Action-node retargeting (Phase 3).
@@ -67,6 +69,7 @@ public class FlowNode {
     public uint   CheckParamId { get; set; } = 0;     // action/status id parameter (picker)
     public float  CheckParam2  { get; set; } = 0f;    // secondary numeric (range, etc.)
     public int    CheckTarget  { get; set; } = 0;     // 0=Self/Player, 1=CurrentTarget
+    public int    CheckSource  { get; set; } = 0;     // status source: 0=applied by me, 1=any owner
 
     // Built-in retarget resolver for Action nodes (Phase 3); 0 = None. Legacy single-mode slot,
     // kept for back-compat; superseded by RetargetPriority (migrated on first resolve).
@@ -74,7 +77,9 @@ public class FlowNode {
 
     // Ordered retarget priority chain (RetargetMode ints). Resolved top-to-bottom; the first
     // valid, in-range target wins. Empty = fall back to the legacy RetargetMode.
-    public List<int> RetargetPriority { get; set; } = new();
+    // Setter coalesces null so imported JSON with "RetargetPriority": null can't NRE the editor.
+    private List<int> _retargetPriority = new();
+    public List<int> RetargetPriority { get => _retargetPriority; set => _retargetPriority = value ?? new(); }
 
     // Cached oGCD hint for the editor UI; the executor derives this live via ActionHelper.IsOgcd.
     public bool IsOgcd { get; set; } = false;
@@ -94,7 +99,7 @@ public class FlowNode {
         Id = Id, Type = Type, X = X, Y = Y, ActionId = ActionId, ActionLabel = ActionLabel,
         IconId = IconId, OutputCount = OutputCount,
         ConditionField = ConditionField, ConditionCompareOp = ConditionCompareOp, ConditionCompareVal = ConditionCompareVal,
-        CheckField = CheckField, CheckParamId = CheckParamId, CheckParam2 = CheckParam2, CheckTarget = CheckTarget,
+        CheckField = CheckField, CheckParamId = CheckParamId, CheckParam2 = CheckParam2, CheckTarget = CheckTarget, CheckSource = CheckSource,
         RetargetMode = RetargetMode, RetargetPriority = new(RetargetPriority), IsOgcd = IsOgcd,
         NoteText = NoteText, NoteW = NoteW, NoteH = NoteH, GroupId = GroupId,
     };
@@ -103,7 +108,8 @@ public class FlowNode {
     public static bool IsGate(NodeType t) => t is NodeType.Condition
         or NodeType.StatusCondition or NodeType.CooldownCondition
         or NodeType.TargetCondition or NodeType.PlayerCondition
-        or NodeType.PartyCondition;
+        or NodeType.PartyCondition or NodeType.ActionHistoryCondition
+        or NodeType.GaugeCondition;
 
     public bool IsGate() => IsGate(Type);
 }

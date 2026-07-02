@@ -591,10 +591,13 @@ internal static class FlowExecutor {
             return false;
         }
 
-        // Parameterized condition-family gate (Status/Cooldown/Target/Player/Party).
-        var def = ConditionCatalog.Find(condNode.Type, condNode.CheckField);
+        // Parameterized condition-family gate (Status/Cooldown/Target/Player/Party/ActionHistory/
+        // Gauge). Gauge defs are job-scoped, so resolve them through the job-aware lookup.
+        var def = condNode.Type == NodeType.GaugeCondition
+            ? ConditionCatalog.FindGauge(job, condNode.CheckField)
+            : ConditionCatalog.Find(condNode.Type, condNode.CheckField);
         if (def == null) return false;
-        var ctx = new CheckCtx(condNode.CheckParamId, condNode.CheckParam2, condNode.CheckTarget == 1);
+        var ctx = new CheckCtx(condNode.CheckParamId, condNode.CheckParam2, condNode.CheckTarget == 1, condNode.CheckSource == 1);
         // Target-dependent checks fail closed with no target, so a negated form (e.g. "!in melee
         // range") can't pass while untargeted regardless of CompareOp.
         bool needsTarget = def.RequiresTarget || (def.HasTarget && ctx.TargetIsCurrent);

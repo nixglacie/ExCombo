@@ -130,6 +130,14 @@ internal sealed class ActionHook : IDisposable {
             return false;
         }
 
+        // Record the player's own casts for action-history conditions. Executed now = a queued action
+        // firing (a5=1) or an immediate press that didn't just enqueue (a5=0 && !ActionQueued). Adjust
+        // via the unhooked Original so this doesn't re-enter the Detour.
+        if (actionType == (uint)ActionType.Action) {
+            var executed = a5 == 1 || !ActionManager.Instance()->ActionQueued;
+            if (executed) Helpers.ActionTracker.Record(_hook.Original(actionManager, actionId));
+        }
+
         try {
             foreach (var flow in _config.Flows) {
                 if (!flow.Enabled) continue;

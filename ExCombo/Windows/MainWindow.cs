@@ -9,11 +9,15 @@ using Dalamud.Interface.Components;
 using Dalamud.Interface.Textures;
 using Dalamud.Interface.Textures.TextureWraps;
 using Dalamud.Interface.Windowing;
+using Dalamud.Utility;
 using ExCombo.Flow;
 
 namespace ExCombo.Windows;
 
 public class MainWindow : Window {
+    internal const string KofiUrl = "https://ko-fi.com/eexora";
+    internal static readonly Vector4 KofiRed = new(1f, 0.369f, 0.357f, 1f); // Ko-fi brand #FF5E5B
+
     private readonly Configuration  _config;
     private readonly FlowEditorWindow _editor;
     private readonly ConfigWindow   _configWindow;
@@ -97,12 +101,28 @@ public class MainWindow : Window {
         if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.FileImport, "Import")) TryImport();
         ImGui.PopStyleVar();
 
-        // Settings button — right-aligned
+        // Ko-fi + Settings buttons — right-aligned
         {
             ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(7f, 6f));
-            float btnW = ImGui.GetFontSize() + 14f; // icon + 2*framePadX
-            float padX = ImGui.GetStyle().WindowPadding.X;
-            ImGui.SameLine(ImGui.GetWindowWidth() - padX - btnW);
+            float btnW   = ImGui.GetFontSize() + 14f; // icon + 2*framePadX
+            bool  kofi   = _config.ShowKofiButton;
+            float totalW = kofi ? btnW * 2f + 4f : btnW;
+            // Content-region right edge accounts for the scrollbar; window width does not.
+            ImGui.SameLine();
+            ImGui.SameLine(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - totalW);
+
+            if (kofi) {
+                ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.173f, 0.180f, 0.200f, 1f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.333f, 0.353f, 0.388f, 1f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.Accent(0.20f));
+                ImGui.PushStyleColor(ImGuiCol.Text,          KofiRed);
+                if (ImGuiComponents.IconButton(FontAwesomeIcon.Coffee))
+                    Util.OpenLink(KofiUrl);
+                ImGui.PopStyleColor(4);
+                if (ImGui.IsItemHovered()) Tip("Ko-fi");
+                ImGui.SameLine(0, 4f);
+            }
+
             ImGui.PushStyleColor(ImGuiCol.Button,        new Vector4(0.173f, 0.180f, 0.200f, 1f));
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.333f, 0.353f, 0.388f, 1f));
             ImGui.PushStyleColor(ImGuiCol.ButtonActive,  Style.Accent(0.20f));
@@ -256,9 +276,9 @@ public class MainWindow : Window {
                     ImGui.SetCursorScreenPos(new Vector2(ImGui.GetCursorScreenPos().X, midY - ImGui.GetFrameHeight() / 2f));
                     // Cap width so the field stops before the right-side trigger icons / action buttons.
                     const float RIcoSz = 26f, RIcoGap = 4f, RTrigSz = 26f, RTrigGap = 4f;
-                    float rWinW  = ImGui.GetWindowWidth();
-                    float rPadX  = ImGui.GetStyle().WindowPadding.X;
-                    float rDelX  = rWinW - rPadX - RowPadX - RIcoSz;
+                    // Anchor to the content-region right edge (shrinks with the scrollbar), not the
+                    // window width — otherwise the field runs under the scrollbar.
+                    float rDelX  = startCursorPos.X + availW - RowPadX - RIcoSz;
                     float rEditX = rDelX - 3f * (RIcoGap + RIcoSz);
                     int   rTrigN = flow.Nodes.FindAll(n => n.Type == NodeType.Trigger && n.IconId != 0).Count;
                     float rTrigW = rTrigN * RTrigSz + Math.Max(0, rTrigN - 1) * RTrigGap;
@@ -317,9 +337,9 @@ public class MainWindow : Window {
                 // ── Action buttons (right-aligned, icon-only) ──────────────
                 const float IcoSz  = 26f;
                 const float IcoGap = 4f;
-                float winW  = ImGui.GetWindowWidth();
-                float padX  = ImGui.GetStyle().WindowPadding.X;
-                float delX   = winW - padX - RowPadX - IcoSz;
+                // Anchor to the content-region right edge (shrinks with the scrollbar), not the
+                // window width — otherwise the icons overflow under the scrollbar.
+                float delX   = startCursorPos.X + availW - RowPadX - IcoSz;
                 float expX   = delX   - IcoGap - IcoSz;
                 float cloneX = expX   - IcoGap - IcoSz;
                 float editX  = cloneX - IcoGap - IcoSz;
@@ -568,13 +588,18 @@ public class MainWindow : Window {
     }
 
     private void ExportFlow(ComboFlow flow) {
-        try   { ImGui.SetClipboardText(JsonSerializer.Serialize(flow, JsonOpts)); SetStatus("Copied!"); }
+        try   {
+            if (Helpers.ClipboardHelper.SetText(JsonSerializer.Serialize(flow, JsonOpts))) SetStatus("Copied!");
+            else SetStatus("Export failed: clipboard unavailable.", error: true);
+        }
         catch { SetStatus("Export failed."); }
     }
 
     private void TryImport() {
         try {
-            var imported = JsonSerializer.Deserialize<ComboFlow>(ImGui.GetClipboardText(), JsonOpts);
+            var clip = Helpers.ClipboardHelper.GetText();
+            Plugin.LogDebug($"[ExCombo][Import] clipboard len={clip?.Length ?? -1} head={(clip is { Length: > 0 } ? clip[..Math.Min(40, clip.Length)] : "<empty>")}");
+            var imported = JsonSerializer.Deserialize<ComboFlow>(clip ?? "", JsonOpts);
             if (imported == null) { SetStatus("Nothing valid in clipboard."); return; }
             imported.Id   = Guid.NewGuid().ToString();
             imported.Name = imported.Name.EndsWith(" (imported)") ? imported.Name : imported.Name + " (imported)";
@@ -598,8 +623,9 @@ public class MainWindow : Window {
             SetStatus(conflict
                 ? $"Imported \"{imported.Name}\" (disabled — conflicts with an enabled flow)"
                 : $"Imported \"{imported.Name}\"");
-        } catch {
-            SetStatus("Clipboard doesn't contain a valid flow.");
+        } catch (Exception ex) {
+            Plugin.LogDebug($"[ExCombo][Import] failed: {ex}");
+            SetStatus($"Import failed: {ex.Message}", error: true);
         }
     }
 

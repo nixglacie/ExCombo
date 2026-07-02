@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Dalamud.Game.ClientState.Objects.Enums;
 using Dalamud.Game.ClientState.Objects.Types;
 
 namespace ExCombo.Helpers;
@@ -83,6 +84,13 @@ internal static class PartyHelper {
     public static IBattleChara? Slot(int index) {
         var m = Members();
         return index >= 0 && index < m.Count ? m[index] : null;
+    }
+
+    // Any party member (incl. self) is in combat (from Wrath Functions/Party.cs PartyInCombat).
+    public static bool AnyInCombat() {
+        foreach (var m in Members())
+            if (m.StatusFlags.HasFlag(StatusFlags.InCombat)) return true;
+        return false;
     }
 
     public static int DeadCount() {

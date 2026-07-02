@@ -25,9 +25,14 @@ public class RetargetPreset {
 
 [Serializable]
 public class Configuration : IPluginConfiguration {
-    public int             Version      { get; set; } = 1;
-    public List<ComboFlow> Flows        { get; set; } = new();
-    public bool            ShowDtrEntry { get; set; } = true;
+    public int             Version        { get; set; } = 1;
+    public List<ComboFlow> Flows          { get; set; } = new();
+    public bool            ShowDtrEntry   { get; set; } = true;
+    public bool            ShowKofiButton { get; set; } = true;   // Ko-fi button in the main window toolbar
+
+    // ── Server info bar (DTR) extras ─────────────────────────────────────
+    public bool DtrShowState      { get; set; } = false;   // append master On/Off state
+    public bool DtrShowActiveFlow { get; set; } = false;   // append active flow name for the current job
 
     // User-defined reusable retarget priority chains (global, job-agnostic).
     public List<RetargetPreset> RetargetPresets { get; set; } = new();
